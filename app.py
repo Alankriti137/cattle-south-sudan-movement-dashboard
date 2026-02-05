@@ -37,22 +37,26 @@ folium.GeoJson(
 ).add_to(m)
 
 # ---- nowcast heatmap (synthetic v1) ----
-if show_nowcast:
-    # sample points inside the country boundary
-    # we generate random points in the bbox, then keep only those inside South Sudan
-    minx, miny, maxx, maxy = gdf.total_bounds  # lon/lat bbox
-    points = []
-    # simple random sampling; enough for a smooth heatmap but not heavy
+@st.cache_data
+def build_nowcast_points(bounds, geom_wkt):
+    minx, miny, maxx, maxy = bounds
+    geom = gpd.GeoSeries.from_wkt([geom_wkt], crs="EPSG:4326").iloc[0]
+
     import random
+    random.seed(42)
+    pts = []
     for _ in range(800):
         lon = random.uniform(minx, maxx)
         lat = random.uniform(miny, maxy)
-        p = gpd.GeoSeries([gpd.points_from_xy([lon], [lat])[0]], crs="EPSG:4326")
-        # keep point if inside polygon
-        if gdf.geometry.unary_union.contains(p.iloc[0]):
-            # synthetic "suitability": higher near center-south (placeholder until real data)
+        if geom.contains(gpd.points_from_xy([lon], [lat])[0]):
             score = max(0, 1 - (abs(lat - 7.0) / 6) - (abs(lon - 30.5) / 10))
-            points.append([lat, lon, score])
+            pts.append([lat, lon, score])
+    return pts
+
+if show_nowcast:
+    bounds = tuple(gdf.total_bounds)
+    geom_wkt = gdf.geometry.unary_union.wkt
+    points = build_nowcast_points(bounds, geom_wkt)
     HeatMap(points, name="Nowcast heatmap").add_to(m)
 
 if show_fc7:
@@ -64,4 +68,4 @@ if show_anom:
 
 folium.LayerControl(collapsed=False).add_to(m)
 
-st_folium(m, width=900, height=650)
+st_folium(m, width=900, height=650, key="ss_map")
