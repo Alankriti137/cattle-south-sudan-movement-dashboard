@@ -2,6 +2,7 @@ import streamlit as st
 import geopandas as gpd
 import folium
 from streamlit_folium import st_folium
+from folium.plugins import HeatMap
 
 st.set_page_config(
     page_title="Cattle in South Sudan Movement Dashboard",
