@@ -2,6 +2,25 @@ import streamlit as st
 import geopandas as gpd
 import folium
 from streamlit_folium import st_folium
+def top_hotspots(points, k=5):
+    # points: [lat, lon, score]
+    pts = sorted(points, key=lambda x: x[2], reverse=True)[:200]
+    hotspots = []
+    used = []
+
+    def far_enough(lat, lon):
+        for la, lo in used:
+            if abs(la - lat) < 0.7 and abs(lo - lon) < 0.7:
+                return False
+        return True
+
+    for lat, lon, score in pts:
+        if far_enough(lat, lon):
+            hotspots.append({"lat": lat, "lon": lon, "score": float(score)})
+            used.append((lat, lon))
+        if len(hotspots) >= k:
+            break
+    return hotspots
 from folium.plugins import HeatMap
 
 st.set_page_config(
@@ -68,4 +87,20 @@ if show_anom:
 
 folium.LayerControl(collapsed=False).add_to(m)
 
-st_folium(m, width=900, height=650, key="ss_map")
+col1, col2 = st.columns([3, 1], gap="large")
+
+with col1:
+    st_folium(m, width=900, height=650, key="ss_map")
+
+with col2:
+    st.subheader("alerts")
+    if show_nowcast:
+        hotspots = top_hotspots(points, k=5)
+        for i, h in enumerate(hotspots, start=1):
+            st.markdown(f"**{i}. hotspot**")
+            st.write(f"score: {h['score']:.2f}")
+            st.write(f"lat/lon: {h['lat']:.3f}, {h['lon']:.3f}")
+            st.caption("flagged because suitability is high relative to other areas (v1 heuristic).")
+            st.divider()
+    else:
+        st.caption("turn on nowcast to generate alerts.")
