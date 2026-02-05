@@ -19,7 +19,7 @@ show_fc30 = st.sidebar.checkbox("Forecast (30 days)")
 show_anom = st.sidebar.checkbox("Anomaly alerts")
 
 # load south sudan boundary
-gdf = gpd.read_file("data/south_sudan.geojson")
+gdf = gpd.read_file("data/south_sudan.geojson.json")
 gdf = gdf.to_crs(epsg=4326)
 
 # map
