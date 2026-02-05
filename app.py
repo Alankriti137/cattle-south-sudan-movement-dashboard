@@ -8,7 +8,7 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("Cattle in South Sudan Movement Dashboard (v1)")
+st.title("Cattle in South Sudan Movement Dashboard")
 st.caption("Near-real-time (weekly) cattle movement suitability, forecasts, and alerts")
 
 # sidebar
