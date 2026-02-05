@@ -36,9 +36,25 @@ folium.GeoJson(
     }
 ).add_to(m)
 
-# placeholder layers
+# ---- nowcast heatmap (synthetic v1) ----
 if show_nowcast:
-    folium.Marker([7.0, 31.0], tooltip="Nowcast placeholder").add_to(m)
+    # sample points inside the country boundary
+    # we generate random points in the bbox, then keep only those inside South Sudan
+    minx, miny, maxx, maxy = gdf.total_bounds  # lon/lat bbox
+    points = []
+    # simple random sampling; enough for a smooth heatmap but not heavy
+    import random
+    for _ in range(800):
+        lon = random.uniform(minx, maxx)
+        lat = random.uniform(miny, maxy)
+        p = gpd.GeoSeries([gpd.points_from_xy([lon], [lat])[0]], crs="EPSG:4326")
+        # keep point if inside polygon
+        if gdf.geometry.unary_union.contains(p.iloc[0]):
+            # synthetic "suitability": higher near center-south (placeholder until real data)
+            score = max(0, 1 - (abs(lat - 7.0) / 6) - (abs(lon - 30.5) / 10))
+            points.append([lat, lon, score])
+    HeatMap(points, name="Nowcast heatmap").add_to(m)
+
 if show_fc7:
     folium.Marker([8.0, 30.0], tooltip="7-day forecast placeholder").add_to(m)
 if show_fc30:
