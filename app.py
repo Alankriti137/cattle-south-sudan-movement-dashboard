@@ -240,7 +240,7 @@ with right:
         st.markdown("### 7-day")
         for idx, (p, delta) in enumerate(alerts_7, start=1):
             st.markdown(
-                f"**{idx}. movement shift**  \n"
+                f"**{idx}. {('new hotspot' if delta > 0.75 else 'route deviation' if delta > 0.45 else 'moderate increase')}**  \n"
                 f"delta: **+{delta:.2f}**  \n"
                 f"score: {p[2]:.2f}  \n"
                 f"lat/lon: {p[0]:.3f}, {p[1]:.3f}  \n"
