@@ -1,4 +1,4 @@
-import streamlit as st
+Fimport streamlit as st
 import geopandas as gpd
 import folium
 from streamlit_folium import st_folium
@@ -44,7 +44,9 @@ gdf = gdf.to_crs(epsg=4326)
 
 # map
 m = folium.Map(location=[7.5, 30], zoom_start=6, tiles="cartodbpositron")
+from folium.plugins import MarkerCluster
 
+marker_cluster = MarkerCluster().add_to(m)
 folium.GeoJson(
     gdf,
     name="South Sudan",
@@ -84,7 +86,24 @@ if show_fc30:
     folium.Marker([6.5, 29.5], tooltip="30-day forecast placeholder").add_to(m)
 if show_anom:
     folium.Marker([7.8, 32.2], tooltip="Anomaly placeholder").add_to(m)
+# --- signal markers ---
+folium.Marker(
+    location=[7.6, 31.2],
+    popup="High vegetation availability (food)",
+    icon=folium.Icon(color="green", icon="leaf")
+).add_to(marker_cluster)
 
+folium.Marker(
+    location=[8.1, 32.6],
+    popup="Permanent water access",
+    icon=folium.Icon(color="blue", icon="tint")
+).add_to(marker_cluster)
+
+folium.Marker(
+    location=[7.9, 30.8],
+    popup="Herd convergence / grazing pressure",
+    icon=folium.Icon(color="red", icon="warning-sign")
+).add_to(marker_cluster)
 folium.LayerControl(collapsed=False).add_to(m)
 
 col1, col2 = st.columns([3, 1], gap="large")
