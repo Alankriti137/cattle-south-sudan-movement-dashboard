@@ -142,11 +142,23 @@ def explain(p):
     for name, val in drivers[:2]:
         parts.append(f"{name} strong ({val:.2f})")
     return ", ".join(parts)
+# ----------------------------
+# map view state (so alerts can zoom map)
+# ----------------------------
+if "map_center" not in st.session_state:
+    st.session_state.map_center = [CENTER_LAT, CENTER_LON]
+if "map_zoom" not in st.session_state:
+    st.session_state.map_zoom = 6
 
 # ----------------------------
 # build folium map
 # ----------------------------
-m = folium.Map(location=[CENTER_LAT, CENTER_LON], zoom_start=6, tiles=None, control_scale=True)
+m = folium.Map(
+    location=st.session_state.map_center,
+    zoom_start=st.session_state.map_zoom,
+    tiles=None,
+    control_scale=True
+)
 
 # base layers (so you can actually switch)
 folium.TileLayer("cartodbpositron", name="Street map (Carto)").add_to(m)
@@ -236,7 +248,10 @@ with right:
         st.info("turn on 'Anomaly alerts' in the sidebar to view alerts.")
     else:
         st.caption("alerts = places that get hotter vs nowcast (delta score)")
-
+if st.button(f"zoom to 7-day alert #{idx}", key=f"z7_{idx}"):
+    st.session_state.map_center = [p[0], p[1]]
+    st.session_state.map_zoom = 9
+    st.rerun()
         st.markdown("### 7-day")
         for idx, (p, delta) in enumerate(alerts_7, start=1):
             st.markdown(
@@ -247,7 +262,10 @@ with right:
                 f"why: {explain(p)}"
             )
             st.divider()
-
+if st.button(f"zoom to 30-day alert #{idx}", key=f"z30_{idx}"):
+    st.session_state.map_center = [p[0], p[1]]
+    st.session_state.map_zoom = 9
+    st.rerun()
         st.markdown("### 30-day")
         for idx, (p, delta) in enumerate(alerts_30, start=1):
             st.markdown(
