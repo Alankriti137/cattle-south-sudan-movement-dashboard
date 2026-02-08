@@ -23,7 +23,7 @@ def top_hotspots(points, k=5):
     return hotspots
 from folium.plugins import HeatMap
 
-st.set_page_config(
+st.set_page_config(layout="wide")
     st.sidebar.header("Layers")
 
 show_nowcast = st.sidebar.checkbox("Nowcast (current)", True)
