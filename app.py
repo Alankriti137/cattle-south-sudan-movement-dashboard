@@ -266,7 +266,7 @@ if st.button(f"zoom to 30-day alert #{idx}", key=f"z30_{idx}"):
     st.session_state.map_center = [p[0], p[1]]
     st.session_state.map_zoom = 9
     st.rerun()
-        st.markdown("### 30-day")
+st.markdown("### 30-day")
         for idx, (p, delta) in enumerate(alerts_30, start=1):
             st.markdown(
                 f"**{idx}. movement shift**  \n"
