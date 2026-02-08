@@ -476,6 +476,29 @@ with right:
     st.header("Alerts")
     st.caption("Alerts highlight places where forecast suitability increases vs nowcast (delta score).")
 
+def render_alert_card(title, p, delta):
+    # p = (lat, lon, score, veg, rain, access)
+    lat, lon, score, veg, rain, access = p
+    st.markdown(f"### {title}")
+    st.caption(f"Lat/Lon: {lat:.3f}, {lon:.3f}")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.metric("Delta vs nowcast", f"{delta:+.2f}")
+    with c2:
+        st.metric("Forecast total score", f"{score:.2f}")
+
+    c3, c4, c5 = st.columns(3)
+    with c3:
+        st.metric("Rainfall", f"{rain:.2f}")
+    with c4:
+        st.metric("Forage/vegetation", f"{veg:.2f}")
+    with c5:
+        st.metric("Access/centrality", f"{access:.2f}")
+
+    st.caption(f"Top drivers: {explain(p)}")
+    st.divider()
+
     # Quick “real data” disclosure
     st.info(
         f"**Real layers:** Basemap can be Carto / Esri / **MODIS True Color (NASA GIBS, {modis_date})**. "
