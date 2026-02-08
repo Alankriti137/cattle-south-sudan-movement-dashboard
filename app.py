@@ -226,6 +226,11 @@ if "map_center" not in st.session_state:
     st.session_state.map_center = [CENTER_LAT, CENTER_LON]
 if "map_zoom" not in st.session_state:
     st.session_state.map_zoom = 6
+# selection state (marker click -> selects an alert)
+if "selected_kind" not in st.session_state:
+    st.session_state.selected_kind = None   # "7d" or "30d"
+if "selected_idx" not in st.session_state:
+    st.session_state.selected_idx = None    # 1-based alert number
 if "force_view" not in st.session_state:
     st.session_state.force_view = False  # only True when user clicks zoom buttons
 
@@ -411,6 +416,20 @@ if show_30_markers:
 
 folium.LayerControl(collapsed=False).add_to(m)
 
+def nearest_alert(click_lat, click_lon, alerts, tol=0.35):
+    """
+    Returns (idx, p, delta) for the nearest alert within tol degrees, else (None, None, None).
+    alerts = [(p, delta), ...] where p=(lat, lon, score, veg, rain, access)
+    """
+    best = (None, None, None, 1e9)  # idx, p, delta, dist2
+    for idx, (p, delta) in enumerate(alerts, start=1):
+        d2 = (p[0] - click_lat) ** 2 + (p[1] - click_lon) ** 2
+        if d2 < best[3]:
+            best = (idx, p, delta, d2)
+    # tol is in degrees; compare squared distance
+    if best[0] is not None and best[3] <= (tol ** 2):
+        return best[0], best[1], best[2]
+    return None, None, None
 
 # ============================================================
 # Layout: map + alerts panel
@@ -418,10 +437,30 @@ folium.LayerControl(collapsed=False).add_to(m)
 left, right = st.columns([2.2, 1.0], gap="large")
 
 with left:
-    # IMPORTANT: preserve user view without blinking/teleporting
-    map_out = st_folium(m, width=None, height=650, returned_objects=["center", "zoom"])
+    folium_out = st_folium(m, width=None, height=650)
 
-    # Update session state from user interaction *unless* we just forced a zoom via a button
+# If user clicked something on the map, try to match it to an alert and "jump" there
+clicked = (folium_out or {}).get("last_object_clicked")
+if clicked and "lat" in clicked and "lng" in clicked:
+    clat, clon = float(clicked["lat"]), float(clicked["lng"])
+
+    # Prefer 7-day alerts first; if none match, try 30-day
+    idx7, p7, d7 = nearest_alert(clat, clon, alerts_7)
+    idx30, p30, d30 = nearest_alert(clat, clon, alerts_30)
+
+    if idx7 is not None:
+        st.session_state.selected_kind = "7d"
+        st.session_state.selected_idx = idx7
+        st.session_state.map_center = [p7[0], p7[1]]
+        st.session_state.map_zoom = 9
+        st.rerun()
+
+    elif idx30 is not None:
+        st.session_state.selected_kind = "30d"
+        st.session_state.selected_idx = idx30
+        st.session_state.map_center = [p30[0], p30[1]]
+        st.session_state.map_zoom = 9
+        st.rerun()
     if map_out and isinstance(map_out, dict):
         if not st.session_state.force_view:
             if "center" in map_out and map_out["center"]:
