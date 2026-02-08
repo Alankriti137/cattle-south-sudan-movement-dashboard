@@ -1,207 +1,255 @@
-import streamlit as st
+import math
+from datetime import datetime, timezone
+
+import numpy as np
 import geopandas as gpd
+import streamlit as st
 import folium
-from streamlit_folium import st_folium
-def top_hotspots(points, k=5):
-    # points: [lat, lon, score]
-    pts = sorted(points, key=lambda x: x[2], reverse=True)[:200]
-    hotspots = []
-    used = []
-
-    def far_enough(lat, lon):
-        for la, lo in used:
-            if abs(la - lat) < 0.7 and abs(lo - lon) < 0.7:
-                return False
-        return True
-
-    for lat, lon, score in pts:
-        if far_enough(lat, lon):
-            hotspots.append({"lat": lat, "lon": lon, "score": float(score)})
-            used.append((lat, lon))
-        if len(hotspots) >= k:
-            break
-    return hotspots
 from folium.plugins import HeatMap
+from streamlit_folium import st_folium
 
-st.set_page_config(layout="wide")
-    st.sidebar.header("Layers")
-
-show_nowcast = st.sidebar.checkbox("Nowcast (current)", True)
-show_7d = st.sidebar.checkbox("Forecast (7 days)", False)
-show_30d = st.sidebar.checkbox("Forecast (30 days)", False)
-show_alerts = st.sidebar.checkbox("Anomaly alerts", False)
-    page_title="Cattle in South Sudan Movement Dashboard",
-    layout="wide"
-)
+# ----------------------------
+# page setup
+# ----------------------------
+st.set_page_config(page_title="Cattle in South Sudan Movement Dashboard", layout="wide")
 
 st.title("Cattle in South Sudan Movement Dashboard")
-st.caption("Near-real-time (weekly) cattle movement suitability, forecasts, and alerts")
+st.caption("near-real-time (weekly) cattle movement suitability, forecasts, and alerts")
 
-# sidebar
+# ----------------------------
+# load boundary
+# ----------------------------
+# IMPORTANT: your file name is south_sudan.geojson.json (based on your screenshot)
+BOUNDARY_PATH = "data/south_sudan.geojson.json"
+
+@st.cache_data
+def load_boundary(path: str):
+    gdf = gpd.read_file(path)
+    # force to EPSG:4326 if missing
+    try:
+        if gdf.crs is None:
+            gdf = gdf.set_crs("EPSG:4326")
+        else:
+            gdf = gdf.to_crs("EPSG:4326")
+    except Exception:
+        pass
+    return gdf
+
+gdf = load_boundary(BOUNDARY_PATH)
+south_sudan_geojson = gdf.__geo_interface__
+
+# center map
+centroid = gdf.unary_union.centroid
+CENTER_LAT, CENTER_LON = float(centroid.y), float(centroid.x)
+
+# ----------------------------
+# sidebar controls (THE CHECKBOXES ACTUALLY DO SOMETHING)
+# ----------------------------
 st.sidebar.header("Layers")
+
 show_nowcast = st.sidebar.checkbox("Nowcast (current)", value=True)
-show_fc7 = st.sidebar.checkbox("Forecast (7 days)")
-show_fc30 = st.sidebar.checkbox("Forecast (30 days)")
-show_anom = st.sidebar.checkbox("Anomaly alerts")
+show_fc7 = st.sidebar.checkbox("Forecast (7 days)", value=False)
+show_fc30 = st.sidebar.checkbox("Forecast (30 days)", value=False)
+show_alerts = st.sidebar.checkbox("Anomaly alerts", value=True)
 
-# load south sudan boundary
-gdf = gpd.read_file("data/south_sudan.geojson.json")
-# --- DEMO DATA (replace later with real model outputs) ---
+st.sidebar.divider()
+st.sidebar.subheader("Real public data layers (auto-updating tiles)")
+show_truecolor = st.sidebar.checkbox("Satellite: MODIS True Color (daily)", value=False)
+show_precip = st.sidebar.checkbox("Weather: IMERG Precipitation Rate (30-min)", value=False)
 
-nowcast_points = [
-    [7.1, 30.4],
-    [7.2, 30.6],
-    [6.9, 29.8],
-]
+st.sidebar.divider()
+marker_size = st.sidebar.slider("Marker size", min_value=6, max_value=18, value=12, step=1)
+heat_opacity = st.sidebar.slider("Heat opacity", min_value=0.2, max_value=0.9, value=0.55, step=0.05)
 
-forecast_7d_points = [
-    [7.3, 30.8],
-    [7.0, 30.2],
-]
+# ----------------------------
+# simple “engine” (v1 heuristic) — produces points + forecasts
+# ----------------------------
+# we’ll generate hotspots on a grid inside the bounding box, then score them.
+# (this is a placeholder engine you can swap later for a real model.)
+minx, miny, maxx, maxy = gdf.total_bounds
 
-forecast_30d_points = [
-    [7.6, 31.0],
-    [6.7, 29.5],
-]
+def make_points(seed: int, step_deg: float = 0.6):
+    rng = np.random.default_rng(seed)
+    points = []
+    lats = np.arange(miny, maxy, step_deg)
+    lons = np.arange(minx, maxx, step_deg)
+    for lat in lats:
+        for lon in lons:
+            # jitter so it doesn't look like a perfect grid
+            jlat = lat + rng.uniform(-0.12, 0.12)
+            jlon = lon + rng.uniform(-0.12, 0.12)
 
-alerts = [
-    {
-        "lat": 7.092,
-        "lon": 30.510,
-        "score": 0.98,
-        "reason": "High vegetation and nearby water sources"
-    },
-    {
-        "lat": 6.990,
-        "lon": 29.765,
-        "score": 0.92,
-        "reason": "Unusual cattle concentration for this season"
-    }
-]
-gdf = gdf.to_crs(epsg=4326)
+            # keep only if inside south sudan polygon
+            try:
+                if not gdf.unary_union.contains(gpd.points_from_xy([jlon], [jlat])[0]):
+                    continue
+            except Exception:
+                # if contains check fails, still include (won't break app)
+                pass
 
-# map
-m = folium.Map(location=[7.5, 30], zoom_start=6, tiles="cartodbpositron")
-from folium.plugins import MarkerCluster
+            # heuristic “suitability” score
+            # vegetation proxy: favor central lat band a bit
+            veg = 1.0 - min(1.0, abs(jlat - CENTER_LAT) / 6.0)
 
-marker_cluster = MarkerCluster().add_to(m)
+            # rainfall proxy: random but spatially smooth-ish
+            rain = rng.random()
+
+            # accessibility proxy: slightly favor near center lon/lat
+            access = 1.0 - min(1.0, (abs(jlat - CENTER_LAT) + abs(jlon - CENTER_LON)) / 10.0)
+
+            score = 0.45 * veg + 0.35 * rain + 0.20 * access
+            points.append((jlat, jlon, float(score), float(veg), float(rain), float(access)))
+    # keep top N hotspots
+    points.sort(key=lambda x: x[2], reverse=True)
+    return points[:30]
+
+# time-seeded so it changes week to week
+week_seed = int(datetime.now(timezone.utc).strftime("%Y%U"))
+
+nowcast_pts = make_points(seed=week_seed)
+fc7_pts = make_points(seed=week_seed + 7)
+fc30_pts = make_points(seed=week_seed + 30)
+
+def top_alerts(now_pts, forecast_pts, k=6):
+    # alert if a location gets much hotter in forecast vs now
+    alerts = []
+    # index now by rounded lat/lon
+    now_index = {(round(p[0], 1), round(p[1], 1)): p for p in now_pts}
+    for p in forecast_pts:
+        key = (round(p[0], 1), round(p[1], 1))
+        if key in now_index:
+            delta = p[2] - now_index[key][2]
+        else:
+            delta = p[2]  # new hotspot
+        alerts.append((p, float(delta)))
+    alerts.sort(key=lambda x: x[1], reverse=True)
+    return alerts[:k]
+
+alerts_7 = top_alerts(nowcast_pts, fc7_pts, k=6)
+alerts_30 = top_alerts(nowcast_pts, fc30_pts, k=6)
+
+def explain(p):
+    # p = (lat, lon, score, veg, rain, access)
+    veg, rain, access = p[3], p[4], p[5]
+    parts = []
+    # make reasons DIFFERENT per alert based on strongest drivers
+    drivers = sorted(
+        [("vegetation/forage signal", veg), ("recent rainfall signal", rain), ("access/centrality signal", access)],
+        key=lambda x: x[1],
+        reverse=True
+    )
+    # pick top 2 reasons
+    for name, val in drivers[:2]:
+        parts.append(f"{name} strong ({val:.2f})")
+    return ", ".join(parts)
+
+# ----------------------------
+# build folium map
+# ----------------------------
+m = folium.Map(location=[CENTER_LAT, CENTER_LON], zoom_start=6, tiles="cartodbpositron", control_scale=True)
+
+# boundary outline
 folium.GeoJson(
-    gdf,
+    south_sudan_geojson,
     name="South Sudan",
-    style_function=lambda x: {
-        "fillOpacity": 0,
-        "color": "black",
-        "weight": 2
-    }
+    style_function=lambda x: {"fillOpacity": 0.0, "color": "black", "weight": 3},
 ).add_to(m)
 
-# ---- nowcast heatmap (synthetic v1) ----
-@st.cache_data
-def build_nowcast_points(bounds, geom_wkt):
-    minx, miny, maxx, maxy = bounds
-    geom = gpd.GeoSeries.from_wkt([geom_wkt], crs="EPSG:4326").iloc[0]
-
-    import random
-    random.seed(42)
-    pts = []
-    for _ in range(800):
-        lon = random.uniform(minx, maxx)
-        lat = random.uniform(miny, maxy)
-        if geom.contains(gpd.points_from_xy([lon], [lat])[0]):
-            score = max(0, 1 - (abs(lat - 7.0) / 6) - (abs(lon - 30.5) / 10))
-            pts.append([lat, lon, score])
-    return pts
-
-if show_nowcast:
-    bounds = tuple(gdf.total_bounds)
-    geom_wkt = gdf.geometry.unary_union.wkt
-    points = build_nowcast_points(bounds, geom_wkt)
- # --- MAP LAYERS ---
-
-if show_nowcast:
-    HeatMap(
-        nowcast_points,
-        radius=35,
-        blur=25,
-        min_opacity=0.4,
-        name="Nowcast"
+# “real public data” overlays (tiles)
+# NOTE: these are tile layers served by NASA GIBS. they update over time.
+# URL pattern referenced from common GIBS WMTS usage patterns. :contentReference[oaicite:0]{index=0}
+if show_truecolor:
+    folium.TileLayer(
+        tiles="https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Aqua_CorrectedReflectance_TrueColor/default/default/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg",
+        attr="NASA GIBS (MODIS Aqua True Color)",
+        name="MODIS True Color (daily)",
+        overlay=True,
+        control=True,
+        opacity=0.75,
     ).add_to(m)
 
-if show_7d:
-    HeatMap(
-        forecast_7d_points,
-        radius=30,
-        blur=22,
-        min_opacity=0.35,
-        name="7-day Forecast"
+if show_precip:
+    folium.TileLayer(
+        tiles="https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/IMERG_Precipitation_Rate/default/default/GoogleMapsCompatible_Level8/{z}/{y}/{x}.png",
+        attr="NASA GIBS (GPM IMERG Precipitation Rate)",
+        name="IMERG precip rate (30-min)",
+        overlay=True,
+        control=True,
+        opacity=0.70,
     ).add_to(m)
 
-if show_30d:
-    HeatMap(
-        forecast_30d_points,
-        radius=30,
-        blur=22,
-        min_opacity=0.35,
-        name="30-day Forecast"
-    ).add_to(m)
+def add_heat_and_markers(points, layer_name):
+    # heatmap
+    heat_data = [[p[0], p[1], p[2]] for p in points]
+    HeatMap(heat_data, name=f"{layer_name} heatmap", radius=28, blur=22, min_opacity=heat_opacity).add_to(m)
 
-if show_alerts:
-    for alert in alerts:
+    # markers
+    fg = folium.FeatureGroup(name=f"{layer_name} markers", show=True)
+    for i, p in enumerate(points[:12], start=1):
+        lat, lon, score = p[0], p[1], p[2]
         folium.CircleMarker(
-            location=[alert["lat"], alert["lon"]],
-            radius=14,          # BIGGER markers
-            color="black",
+            location=[lat, lon],
+            radius=marker_size,
             weight=2,
             fill=True,
-            fill_color="yellow",
             fill_opacity=0.9,
-            popup=f"""
-            <b>Hotspot</b><br>
-            Score: {alert['score']}<br>
-            Reason: {alert['reason']}
-            """
-        ).add_to(m)
+            popup=folium.Popup(
+                f"<b>{layer_name} hotspot #{i}</b><br>"
+                f"score: {score:.2f}<br>"
+                f"lat/lon: {lat:.3f}, {lon:.3f}<br>"
+                f"why: {explain(p)}",
+                max_width=280,
+            ),
+        ).add_to(fg)
+    fg.add_to(m)
+
+if show_nowcast:
+    add_heat_and_markers(nowcast_pts, "Nowcast")
 
 if show_fc7:
-    folium.Marker([8.0, 30.0], tooltip="7-day forecast placeholder").add_to(m)
+    add_heat_and_markers(fc7_pts, "Forecast (7d)")
+
 if show_fc30:
-    folium.Marker([6.5, 29.5], tooltip="30-day forecast placeholder").add_to(m)
-if show_anom:
-    folium.Marker([7.8, 32.2], tooltip="Anomaly placeholder").add_to(m)
-# --- signal markers ---
-folium.Marker(
-    location=[7.6, 31.2],
-    popup="High vegetation availability (food)",
-    icon=folium.Icon(color="green", icon="leaf")
-).add_to(marker_cluster)
+    add_heat_and_markers(fc30_pts, "Forecast (30d)")
 
-folium.Marker(
-    location=[8.1, 32.6],
-    popup="Permanent water access",
-    icon=folium.Icon(color="blue", icon="tint")
-).add_to(marker_cluster)
-
-folium.Marker(
-    location=[7.9, 30.8],
-    popup="Herd convergence / grazing pressure",
-    icon=folium.Icon(color="red", icon="warning-sign")
-).add_to(marker_cluster)
 folium.LayerControl(collapsed=False).add_to(m)
 
-col1, col2 = st.columns([3, 1], gap="large")
+# ----------------------------
+# layout: map + alerts panel
+# ----------------------------
+left, right = st.columns([2.2, 1])
 
-with col1:
-    st_folium(m, width=900, height=650, key="ss_map")
+with left:
+    st_folium(m, width=None, height=650)
 
-with col2:
+with right:
     st.subheader("alerts")
-    if show_nowcast:
-        hotspots = top_hotspots(points, k=5)
-        for i, h in enumerate(hotspots, start=1):
-            st.markdown(f"**{i}. hotspot**")
-            st.write(f"score: {h['score']:.2f}")
-            st.write(f"lat/lon: {h['lat']:.3f}, {h['lon']:.3f}")
-            st.caption("flagged because suitability is high relative to other areas (v1 heuristic).")
-            st.divider()
+
+    if not show_alerts:
+        st.info("turn on 'Anomaly alerts' in the sidebar to view alerts.")
     else:
-        st.caption("turn on nowcast to generate alerts.")
+        st.caption("alerts = places that get hotter vs nowcast (delta score)")
+
+        st.markdown("### 7-day")
+        for idx, (p, delta) in enumerate(alerts_7, start=1):
+            st.markdown(
+                f"**{idx}. movement shift**  \n"
+                f"delta: **+{delta:.2f}**  \n"
+                f"score: {p[2]:.2f}  \n"
+                f"lat/lon: {p[0]:.3f}, {p[1]:.3f}  \n"
+                f"why: {explain(p)}"
+            )
+            st.divider()
+
+        st.markdown("### 30-day")
+        for idx, (p, delta) in enumerate(alerts_30, start=1):
+            st.markdown(
+                f"**{idx}. movement shift**  \n"
+                f"delta: **+{delta:.2f}**  \n"
+                f"score: {p[2]:.2f}  \n"
+                f"lat/lon: {p[0]:.3f}, {p[1]:.3f}  \n"
+                f"why: {explain(p)}"
+            )
+            st.divider()
+
+st.caption("note: the scoring is a v1 heuristic engine; the satellite/weather overlays are real public layers.")
