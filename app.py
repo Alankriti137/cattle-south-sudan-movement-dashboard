@@ -252,29 +252,45 @@ if st.button(f"zoom to 7-day alert #{idx}", key=f"z7_{idx}"):
     st.session_state.map_center = [p[0], p[1]]
     st.session_state.map_zoom = 9
     st.rerun()
-st.markdown("### 7-day")
-for idx, (p, delta) in enumerate(alerts_7, start=1):
-            st.markdown(
-                f"**{idx}. {('new hotspot' if delta > 0.75 else 'route deviation' if delta > 0.45 else 'moderate increase')}**  \n"
-                f"delta: **+{delta:.2f}**  \n"
-                f"score: {p[2]:.2f}  \n"
-                f"lat/lon: {p[0]:.3f}, {p[1]:.3f}  \n"
-                f"why: {explain(p)}"
-            )
-            st.divider()
-if st.button(f"zoom to 30-day alert #{idx}", key=f"z30_{idx}"):
-    st.session_state.map_center = [p[0], p[1]]
-    st.session_state.map_zoom = 9
-    st.rerun()
-st.markdown("### 30-day")
-        for idx, (p, delta) in enumerate(alerts_30, start=1):
-            st.markdown(
-                f"**{idx}. movement shift**  \n"
-                f"delta: **+{delta:.2f}**  \n"
-                f"score: {p[2]:.2f}  \n"
-                f"lat/lon: {p[0]:.3f}, {p[1]:.3f}  \n"
-                f"why: {explain(p)}"
-            )
-            st.divider()
+# ----------------------------
+# alerts panel
+# ----------------------------
+st.markdown("## alerts")
+st.caption("alerts = places that get hotter vs nowcast (delta score)")
+
+if not show_alerts:
+    st.info("turn on 'Anomaly alerts' in the sidebar to view alerts.")
+else:
+    st.markdown("### 7-day")
+    for idx, (p, delta) in enumerate(alerts_7, start=1):
+        label = ("new hotspot" if delta > 0.75 else "route deviation" if delta > 0.45 else "moderate increase")
+
+        if st.button(f"zoom to 7-day alert #{idx}", key=f"z7_{idx}"):
+            st.session_state.map_center = [p[0], p[1]]
+            st.session_state.map_zoom = 9
+            st.rerun()
+
+        st.markdown(
+            f"**{idx}. {label}**  \n"
+            f"delta: {delta:+.2f}  \n"
+            f"lat/lon: {p[0]:.3f}, {p[1]:.3f}"
+        )
+        st.divider()
+
+    st.markdown("### 30-day")
+    for idx, (p, delta) in enumerate(alerts_30, start=1):
+        label = ("new hotspot" if delta > 0.75 else "route deviation" if delta > 0.45 else "moderate increase")
+
+        if st.button(f"zoom to 30-day alert #{idx}", key=f"z30_{idx}"):
+            st.session_state.map_center = [p[0], p[1]]
+            st.session_state.map_zoom = 9
+            st.rerun()
+
+        st.markdown(
+            f"**{idx}. {label}**  \n"
+            f"delta: {delta:+.2f}  \n"
+            f"lat/lon: {p[0]:.3f}, {p[1]:.3f}"
+        )
+        st.divider()
 
 st.caption("note: the scoring is a v1 heuristic engine; the satellite/weather overlays are real public layers.")
