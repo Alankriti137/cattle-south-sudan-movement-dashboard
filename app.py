@@ -1,5 +1,8 @@
-import math
+from __future__ import annotations
+
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import List, Tuple, Dict, Any
 
 import numpy as np
 import geopandas as gpd
@@ -10,302 +13,401 @@ from streamlit_folium import st_folium
 
 
 # ============================================================
-# Page setup
+# Config
 # ============================================================
 st.set_page_config(page_title="Cattle in South Sudan Movement Dashboard", layout="wide")
 
-st.title("Cattle in South Sudan Movement Dashboard")
-st.caption("Near-real-time (weekly) cattle movement suitability, forecasts, and alerts")
+TITLE = "Cattle in South Sudan Movement Dashboard"
+CAPTION = "Near-real-time (weekly) cattle movement suitability, forecasts, and alerts"
 
-
-# ============================================================
-# Load boundary (your file)
-# ============================================================
 BOUNDARY_PATH = "data/south_sudan.geojson.json"
 
+# NASA GIBS tiles (REAL data)
+# MODIS True Color (daily) – needs a date in the URL
+# Docs pattern: .../layer/default/{YYYY-MM-DD}/GoogleMapsCompatible_Level{N}/{z}/{y}/{x}.jpg
+GIBS_MODIS_TRUECOLOR_LAYER = "MODIS_Terra_CorrectedReflectance_TrueColor"
+GIBS_IMERG_LAYER = "IMERG_Precipitation_Rate"
+
+# Esri World Imagery (REAL data)
+ESRI_WORLD_IMAGERY = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+
+# Carto basemap
+CARTO = "cartodbpositron"
+
+
+# ============================================================
+# Data structures
+# ============================================================
+@dataclass(frozen=True)
+class ScoredPoint:
+    lat: float
+    lon: float
+    total: float
+    forage: float
+    rainfall: float
+    access: float
+
+
+@dataclass(frozen=True)
+class AlertItem:
+    point: ScoredPoint
+    delta: float
+    label: str
+    top_drivers: List[Tuple[str, float]]
+
+
+# ============================================================
+# Helpers
+# ============================================================
 @st.cache_data
 def load_boundary(path: str) -> gpd.GeoDataFrame:
-    gdf_ = gpd.read_file(path)
-    # Force to EPSG:4326 if missing
-    if gdf_.crs is None:
-        gdf_ = gdf_.set_crs("EPSG:4326")
-    else:
-        gdf_ = gdf_.to_crs("EPSG:4326")
-    return gdf_
+    gdf = gpd.read_file(path)
+    # Force EPSG:4326
+    try:
+        if gdf.crs is None:
+            gdf = gdf.set_crs("EPSG:4326")
+        else:
+            gdf = gdf.to_crs("EPSG:4326")
+    except Exception:
+        # keep whatever it is; don't crash app
+        pass
+    return gdf
+
+
+def today_utc_yyyy_mm_dd() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def make_gibs_modis_truecolor_url(date_str: str) -> str:
+    # Level9 gives nicer detail; you can change to Level8 if needed
+    return (
+        "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/"
+        f"{GIBS_MODIS_TRUECOLOR_LAYER}/default/{date_str}/"
+        "GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg"
+    )
+
+
+def make_gibs_imerg_url() -> str:
+    # IMERG precip rate – PNG tiles, no date in URL (near-real-time service)
+    return (
+        "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/"
+        f"{GIBS_IMERG_LAYER}/default/default/"
+        "GoogleMapsCompatible_Level8/{z}/{y}/{x}.png"
+    )
+
+
+def clamp01(x: float) -> float:
+    return float(max(0.0, min(1.0, x)))
+
+
+def explain_drivers(p: ScoredPoint, top_n: int = 2) -> List[Tuple[str, float]]:
+    drivers = [
+        ("Rainfall", p.rainfall),
+        ("Forage/Vegetation", p.forage),
+        ("Access", p.access),
+    ]
+    drivers.sort(key=lambda t: t[1], reverse=True)
+    return drivers[:top_n]
+
+
+def label_from_delta(delta: float) -> str:
+    # You can tune thresholds later
+    if delta >= 0.75:
+        return "New hotspot likely forming"
+    if delta >= 0.45:
+        return "Route deviation likely"
+    return "Moderate increase"
+
+
+# ============================================================
+# Simple heuristic engine (v1)
+# ============================================================
+def make_points(
+    seed: int,
+    gdf: gpd.GeoDataFrame,
+    center_lat: float,
+    center_lon: float,
+    step_deg: float = 0.6,
+    keep_n: int = 30,
+) -> List[ScoredPoint]:
+    rng = np.random.default_rng(seed)
+
+    minx, miny, maxx, maxy = gdf.total_bounds
+    poly = gdf.unary_union
+
+    points: List[ScoredPoint] = []
+    lats = np.arange(miny, maxy, step_deg)
+    lons = np.arange(minx, maxx, step_deg)
+
+    for lat in lats:
+        for lon in lons:
+            # jitter so it doesn't look like a perfect grid
+            jlat = float(lat + rng.uniform(-0.12, 0.12))
+            jlon = float(lon + rng.uniform(-0.12, 0.12))
+
+            # keep only if inside boundary
+            try:
+                pt = gpd.points_from_xy([jlon], [jlat])[0]
+                if not poly.contains(pt):
+                    continue
+            except Exception:
+                # don't crash if geometry check fails
+                pass
+
+            # --- Model signals (0..1) ---
+            # "Forage" proxy: favor mid-lat band relative to centroid
+            forage = 1.0 - min(1.0, abs(jlat - center_lat) / 6.0)
+
+            # "Rainfall" proxy: random (placeholder) but stable per seed
+            rainfall = rng.random()
+
+            # "Access" proxy: favor closer to centroid
+            access = 1.0 - min(1.0, (abs(jlat - center_lat) + abs(jlon - center_lon)) / 10.0)
+
+            # Weighted total
+            total = 0.45 * forage + 0.35 * rainfall + 0.20 * access
+
+            points.append(
+                ScoredPoint(
+                    lat=jlat,
+                    lon=jlon,
+                    total=clamp01(total),
+                    forage=clamp01(forage),
+                    rainfall=clamp01(rainfall),
+                    access=clamp01(access),
+                )
+            )
+
+    points.sort(key=lambda p: p.total, reverse=True)
+    return points[:keep_n]
+
+
+def compute_alerts(now_pts: List[ScoredPoint], forecast_pts: List[ScoredPoint], k: int = 6) -> List[AlertItem]:
+    # Index now by rounded lat/lon (coarse matching)
+    now_index: Dict[Tuple[float, float], ScoredPoint] = {(round(p.lat, 1), round(p.lon, 1)): p for p in now_pts}
+
+    scored: List[Tuple[ScoredPoint, float]] = []
+    for p in forecast_pts:
+        key = (round(p.lat, 1), round(p.lon, 1))
+        delta = p.total - now_index[key].total if key in now_index else p.total
+        scored.append((p, float(delta)))
+
+    scored.sort(key=lambda t: t[1], reverse=True)
+    top = scored[:k]
+
+    alerts: List[AlertItem] = []
+    for p, delta in top:
+        label = label_from_delta(delta)
+        alerts.append(
+            AlertItem(
+                point=p,
+                delta=delta,
+                label=label,
+                top_drivers=explain_drivers(p, top_n=2),
+            )
+        )
+    return alerts
+
+
+# ============================================================
+# UI
+# ============================================================
+st.title(TITLE)
+st.caption(CAPTION)
 
 gdf = load_boundary(BOUNDARY_PATH)
 south_sudan_geojson = gdf.__geo_interface__
 
-minx, miny, maxx, maxy = gdf.total_bounds
 centroid = gdf.unary_union.centroid
 CENTER_LAT, CENTER_LON = float(centroid.y), float(centroid.x)
 
-DEFAULT_CENTER = [CENTER_LAT, CENTER_LON]
-DEFAULT_ZOOM = 6
-
+# --- Session state for stable map view ---
+if "map_center" not in st.session_state:
+    st.session_state.map_center = [CENTER_LAT, CENTER_LON]
+if "map_zoom" not in st.session_state:
+    st.session_state.map_zoom = 6
+if "force_view" not in st.session_state:
+    st.session_state.force_view = False  # only True when user clicks zoom buttons
 
 # ============================================================
 # Sidebar controls
 # ============================================================
 st.sidebar.header("Layers")
 
-# Basemap choices (Street, Esri Satellite, MODIS True Color)
-basemap = st.sidebar.radio(
+basemap_choice = st.sidebar.radio(
     "Basemap",
-    ["Street map (Carto)", "Satellite (Esri World Imagery)", "MODIS True Color (daily) — NASA GIBS"],
+    options=["Street map (Carto)", "Satellite (Esri World Imagery)", "MODIS True Color (daily) — NASA GIBS"],
     index=0,
 )
 
 st.sidebar.divider()
-
-st.sidebar.subheader("Model layers (dashboard outputs)")
-show_nowcast = st.sidebar.checkbox("Nowcast (current)", value=True)
-show_fc7 = st.sidebar.checkbox("Forecast (7 days)", value=False)
-show_fc30 = st.sidebar.checkbox("Forecast (30 days)", value=False)
-show_alerts = st.sidebar.checkbox("Anomaly alerts", value=True)
-
-st.sidebar.divider()
-
-st.sidebar.subheader("Real public data overlay (auto-updating tiles)")
+st.sidebar.subheader("Real public data overlays (NASA GIBS)")
 show_imerg = st.sidebar.checkbox("Weather: IMERG Precipitation Rate (30-min) — NASA GIBS", value=False)
 
-overlay_opacity = st.sidebar.slider("Overlay opacity", min_value=0.0, max_value=1.0, value=0.70, step=0.05)
+overlay_opacity = st.sidebar.slider("Overlay opacity", 0.0, 1.0, 0.70, 0.05)
 
 st.sidebar.divider()
+st.sidebar.subheader("Model layers (dashboard outputs)")
+show_now_heat = st.sidebar.checkbox("Nowcast heatmap", value=True)
+show_now_markers = st.sidebar.checkbox("Nowcast markers", value=True)
 
-marker_size = st.sidebar.slider("Marker size", min_value=6, max_value=30, value=14, step=1)
-heat_opacity = st.sidebar.slider("Heat opacity", min_value=0.05, max_value=0.95, value=0.55, step=0.05)
+show_7_heat = st.sidebar.checkbox("Forecast (7d) heatmap", value=False)
+show_7_markers = st.sidebar.checkbox("Forecast (7d) markers", value=False)
+
+show_30_heat = st.sidebar.checkbox("Forecast (30d) heatmap", value=False)
+show_30_markers = st.sidebar.checkbox("Forecast (30d) markers", value=False)
+
+show_alerts = st.sidebar.checkbox("Anomaly alerts", value=True)
+show_boundary = st.sidebar.checkbox("South Sudan boundary", value=True)
 
 st.sidebar.divider()
+marker_size = st.sidebar.slider("Marker size", 6, 40, 18, 1)
+heat_max_opacity = st.sidebar.slider("Heat opacity (max)", 0.10, 0.95, 0.55, 0.05)
 
-# Extra zoom buttons
-colz1, colz2 = st.sidebar.columns(2)
-with colz1:
+st.sidebar.divider()
+col_a, col_b = st.sidebar.columns(2)
+with col_a:
     if st.button("Reset view"):
-        st.session_state["map_center"] = DEFAULT_CENTER
-        st.session_state["map_zoom"] = DEFAULT_ZOOM
+        st.session_state.map_center = [CENTER_LAT, CENTER_LON]
+        st.session_state.map_zoom = 6
+        st.session_state.force_view = True
         st.rerun()
-with colz2:
+
+with col_b:
     if st.button("Zoom to S. Sudan"):
-        # Approximate “fit bounds” effect by centering + slightly closer zoom
-        st.session_state["map_center"] = DEFAULT_CENTER
-        st.session_state["map_zoom"] = 7
+        st.session_state.map_center = [CENTER_LAT, CENTER_LON]
+        st.session_state.map_zoom = 7
+        st.session_state.force_view = True
         st.rerun()
 
 
 # ============================================================
-# Engine (v1 heuristic) – produces points + forecasts
+# Generate model points (weekly)
 # ============================================================
-def make_points(seed: int, step_deg: float = 0.6):
-    rng = np.random.default_rng(seed)
-    points = []
-    lats = np.arange(miny, maxy, step_deg)
-    lons = np.arange(minx, maxx, step_deg)
-
-    poly = gdf.unary_union
-
-    for lat in lats:
-        for lon in lons:
-            jlat = lat + rng.uniform(-0.12, 0.12)
-            jlon = lon + rng.uniform(-0.12, 0.12)
-
-            # Keep only if inside South Sudan polygon
-            try:
-                pt = gpd.points_from_xy([jlon], [jlat])[0]
-                if not poly.contains(pt):
-                    continue
-            except Exception:
-                pass
-
-            # Proxies (still "v1 heuristic", but deterministic and explainable)
-            veg = 1.0 - min(1.0, abs(jlat - CENTER_LAT) / 6.0)
-            rain = rng.random()
-            access = 1.0 - min(1.0, (abs(jlat - CENTER_LAT) + abs(jlon - CENTER_LON)) / 10.0)
-
-            score = 0.45 * veg + 0.35 * rain + 0.20 * access
-            points.append((jlat, jlon, float(score), float(veg), float(rain), float(access)))
-
-    points.sort(key=lambda x: x[2], reverse=True)
-    return points[:30]
-
-
-# week-seeded so it changes week-to-week automatically (no reboot needed)
 week_seed = int(datetime.now(timezone.utc).strftime("%Y%U"))
 
-nowcast_pts = make_points(seed=week_seed)
-fc7_pts = make_points(seed=week_seed + 7)
-fc30_pts = make_points(seed=week_seed + 30)
+now_pts = make_points(seed=week_seed, gdf=gdf, center_lat=CENTER_LAT, center_lon=CENTER_LON)
+fc7_pts = make_points(seed=week_seed + 7, gdf=gdf, center_lat=CENTER_LAT, center_lon=CENTER_LON)
+fc30_pts = make_points(seed=week_seed + 30, gdf=gdf, center_lat=CENTER_LAT, center_lon=CENTER_LON)
 
-
-def top_alerts(now_pts, forecast_pts, k=6):
-    """
-    Alerts = places where forecast suitability increases vs nowcast.
-    """
-    now_index = {(round(p[0], 1), round(p[1], 1)): p for p in now_pts}
-    alerts = []
-    for p in forecast_pts:
-        key = (round(p[0], 1), round(p[1], 1))
-        base = now_index.get(key, None)
-        delta = p[2] - (base[2] if base else 0.0)
-        alerts.append((p, float(delta), base))
-    alerts.sort(key=lambda x: x[1], reverse=True)
-    return alerts[:k]
-
-
-alerts_7 = top_alerts(nowcast_pts, fc7_pts, k=6)
-alerts_30 = top_alerts(nowcast_pts, fc30_pts, k=6)
-
-
-def alert_label(delta: float) -> str:
-    if delta > 0.75:
-        return "New hotspot likely forming"
-    if delta > 0.45:
-        return "Route deviation / shift"
-    return "Moderate increase"
-
-
-def explain_drivers(p):
-    # p = (lat, lon, score, veg, rain, access)
-    veg, rain, access = p[3], p[4], p[5]
-    drivers = sorted(
-        [("Rainfall", rain), ("Forage/vegetation", veg), ("Access/centrality", access)],
-        key=lambda x: x[1],
-        reverse=True,
-    )
-    # top 2 driver names + values
-    return drivers[:2]
-
-
-# ============================================================
-# Persist map view (fixes “weird zoom” / resets)
-# ============================================================
-if "map_center" not in st.session_state:
-    st.session_state["map_center"] = DEFAULT_CENTER
-if "map_zoom" not in st.session_state:
-    st.session_state["map_zoom"] = DEFAULT_ZOOM
+alerts_7 = compute_alerts(now_pts, fc7_pts, k=6)
+alerts_30 = compute_alerts(now_pts, fc30_pts, k=6)
 
 
 # ============================================================
 # Build folium map
 # ============================================================
 m = folium.Map(
-    location=st.session_state["map_center"],
-    zoom_start=st.session_state["map_zoom"],
+    location=st.session_state.map_center,
+    zoom_start=st.session_state.map_zoom,
     tiles=None,
     control_scale=True,
-    prefer_canvas=True,  # helps marker rendering look smoother
+    prefer_canvas=True,  # helps marker performance
 )
 
-# --- Basemaps (radio-driven) ---
-# Always add the three basemaps, but only one is "show=True" at a time.
-show_carto = basemap.startswith("Street")
-show_esri = basemap.startswith("Satellite")
-show_modis = basemap.startswith("MODIS")
+# --- Basemaps ---
+folium.TileLayer(CARTO, name="Street map (Carto)", overlay=False, control=True, show=(basemap_choice == "Street map (Carto)")).add_to(m)
 
 folium.TileLayer(
-    "cartodbpositron",
-    name="Street map (Carto)",
-    overlay=False,
-    control=True,
-    show=show_carto,
-).add_to(m)
-
-folium.TileLayer(
-    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    tiles=ESRI_WORLD_IMAGERY,
     attr="Esri World Imagery",
     name="Satellite (Esri World Imagery)",
     overlay=False,
     control=True,
-    show=show_esri,
+    show=(basemap_choice == "Satellite (Esri World Imagery)"),
 ).add_to(m)
 
-# REAL DATA basemap: MODIS True Color via NASA GIBS (auto-updating "default" time)
+# MODIS True Color as a BASEMAP option (REAL)
+modis_date = today_utc_yyyy_mm_dd()
 folium.TileLayer(
-    tiles="https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/"
-          "MODIS_Terra_CorrectedReflectance_TrueColor/default/default/"
-          "GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg",
-    attr="NASA GIBS (MODIS Terra True Color)",
+    tiles=make_gibs_modis_truecolor_url(modis_date),
+    attr=f"NASA GIBS (MODIS True Color) — {modis_date}",
     name="MODIS True Color (daily) — NASA GIBS",
     overlay=False,
     control=True,
-    show=show_modis,
+    show=(basemap_choice == "MODIS True Color (daily) — NASA GIBS"),
 ).add_to(m)
 
-# --- Boundary outline (always on) ---
-folium.GeoJson(
-    south_sudan_geojson,
-    name="South Sudan boundary",
-    style_function=lambda x: {"fillOpacity": 0.0, "color": "black", "weight": 3},
-).add_to(m)
-
-# --- REAL DATA overlay: IMERG precip rate (NASA GIBS) ---
-if show_imerg and overlay_opacity > 0:
+# --- Optional overlay: IMERG precipitation rate (REAL) ---
+if show_imerg:
     folium.TileLayer(
-        tiles="https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/"
-              "IMERG_Precipitation_Rate/default/default/"
-              "GoogleMapsCompatible_Level8/{z}/{y}/{x}.png",
+        tiles=make_gibs_imerg_url(),
         attr="NASA GIBS (GPM IMERG Precipitation Rate)",
         name="IMERG Precipitation Rate (30-min) — NASA GIBS",
         overlay=True,
         control=True,
         opacity=float(overlay_opacity),
+        show=True,
+    ).add_to(m)
+
+# --- Boundary ---
+if show_boundary:
+    folium.GeoJson(
+        south_sudan_geojson,
+        name="South Sudan boundary",
+        style_function=lambda x: {"fillOpacity": 0.0, "color": "black", "weight": 3},
+        show=True,
     ).add_to(m)
 
 
-def add_model_layer(points, layer_name: str, show_layer: bool):
-    """
-    Adds BOTH heat + markers inside a FeatureGroup so the LayerControl checkbox works.
-    """
-    group = folium.FeatureGroup(name=layer_name, show=show_layer)
-
-    # Heat
-    heat_data = [[p[0], p[1], p[2]] for p in points]
+def add_heat(points: List[ScoredPoint], name: str, show: bool) -> None:
+    heat_data = [[p.lat, p.lon, p.total] for p in points]
+    # HeatMap opacity behavior: use max_opacity to control intensity transparency
     HeatMap(
         heat_data,
-        radius=30,
-        blur=24,
-        min_opacity=float(heat_opacity),
-        name=f"{layer_name} heat",
-    ).add_to(group)
+        name=name,
+        radius=28,
+        blur=22,
+        min_opacity=0.10,
+        max_opacity=float(heat_max_opacity),
+        show=show,
+    ).add_to(m)
 
-    # Markers (more visible: thicker outline + tooltip)
-    for i, p in enumerate(points[:14], start=1):
-        lat, lon, score = p[0], p[1], p[2]
-        top2 = explain_drivers(p)
-        tooltip = (
-            f"{layer_name} #{i} | score {score:.2f} | "
-            f"{top2[0][0]} {top2[0][1]:.2f}, {top2[1][0]} {top2[1][1]:.2f}"
+
+def add_markers(points: List[ScoredPoint], name: str, show: bool, max_n: int = 14) -> None:
+    fg = folium.FeatureGroup(name=name, show=show)
+    for i, p in enumerate(points[:max_n], start=1):
+        top = explain_drivers(p, top_n=2)
+        why = ", ".join([f"{k} ({v:.2f})" for k, v in top])
+
+        popup_html = (
+            f"<b>{name} #{i}</b><br>"
+            f"Total score: {p.total:.2f}<br>"
+            f"Rainfall: {p.rainfall:.2f} &nbsp;|&nbsp; Forage: {p.forage:.2f} &nbsp;|&nbsp; Access: {p.access:.2f}<br>"
+            f"Lat/Lon: {p.lat:.3f}, {p.lon:.3f}<br>"
+            f"<b>Top drivers:</b> {why}"
         )
 
         folium.CircleMarker(
-            location=[lat, lon],
+            location=[p.lat, p.lon],
             radius=int(marker_size),
-            weight=3,               # thicker outline (easier to see)
-            color="black",
+            color="#1f77b4",      # visible blue outline
+            weight=2,
             fill=True,
+            fill_color="#1f77b4",
             fill_opacity=0.85,
-            tooltip=tooltip,
-            popup=folium.Popup(
-                f"<b>{layer_name} hotspot #{i}</b><br>"
-                f"Total score: {score:.2f}<br>"
-                f"Lat/Lon: {lat:.3f}, {lon:.3f}<br>"
-                f"Forage/veg: {p[3]:.2f}<br>"
-                f"Rainfall: {p[4]:.2f}<br>"
-                f"Access/centrality: {p[5]:.2f}",
-                max_width=320,
-            ),
-        ).add_to(group)
+            tooltip=f"{name} #{i} • total {p.total:.2f}",
+            popup=folium.Popup(popup_html, max_width=340),
+        ).add_to(fg)
 
-    group.add_to(m)
+    fg.add_to(m)
 
 
-# Add model layers (these now truly respond to sidebar checkboxes)
-if show_nowcast:
-    add_model_layer(nowcast_pts, "Nowcast (current)", show_layer=True)
-if show_fc7:
-    add_model_layer(fc7_pts, "Forecast (7 days)", show_layer=True)
-if show_fc30:
-    add_model_layer(fc30_pts, "Forecast (30 days)", show_layer=True)
+# --- Model layers split exactly as requested ---
+if show_now_heat:
+    add_heat(now_pts, "Nowcast heatmap", show=True)
+if show_now_markers:
+    add_markers(now_pts, "Nowcast markers", show=True)
+
+if show_7_heat:
+    add_heat(fc7_pts, "Forecast (7d) heatmap", show=True)
+if show_7_markers:
+    add_markers(fc7_pts, "Forecast (7d) markers", show=True)
+
+if show_30_heat:
+    add_heat(fc30_pts, "Forecast (30d) heatmap", show=True)
+if show_30_markers:
+    add_markers(fc30_pts, "Forecast (30d) markers", show=True)
 
 folium.LayerControl(collapsed=False).add_to(m)
 
@@ -313,91 +415,82 @@ folium.LayerControl(collapsed=False).add_to(m)
 # ============================================================
 # Layout: map + alerts panel
 # ============================================================
-left, right = st.columns([2.2, 1], gap="large")
+left, right = st.columns([2.2, 1.0], gap="large")
 
 with left:
-    # IMPORTANT: capturing center/zoom fixes “weird zoom reset”
-    map_state = st_folium(
-        m,
-        height=680,
-        use_container_width=True,
-        key="main_map",
-        returned_objects=["center", "zoom"],
-    )
+    # IMPORTANT: preserve user view without blinking/teleporting
+    map_out = st_folium(m, width=None, height=650, returned_objects=["center", "zoom"])
 
-    # Persist user pan/zoom so it doesn't snap back on every interaction
-    if isinstance(map_state, dict):
-        center = map_state.get("center")
-        zoom = map_state.get("zoom")
-        if center and isinstance(center, dict) and "lat" in center and "lng" in center:
-            st.session_state["map_center"] = [float(center["lat"]), float(center["lng"])]
-        if zoom is not None:
-            try:
-                st.session_state["map_zoom"] = int(zoom)
-            except Exception:
-                pass
+    # Update session state from user interaction *unless* we just forced a zoom via a button
+    if map_out and isinstance(map_out, dict):
+        if not st.session_state.force_view:
+            if "center" in map_out and map_out["center"]:
+                st.session_state.map_center = [map_out["center"]["lat"], map_out["center"]["lng"]]
+            if "zoom" in map_out and map_out["zoom"] is not None:
+                st.session_state.map_zoom = int(map_out["zoom"])
+        else:
+            # consume the forced view flag exactly once
+            st.session_state.force_view = False
 
 
 with right:
     st.header("Alerts")
     st.caption("Alerts highlight places where forecast suitability increases vs nowcast (delta score).")
 
+    # Quick “real data” disclosure
+    st.info(
+        f"**Real layers:** Basemap can be Carto / Esri / **MODIS True Color (NASA GIBS, {modis_date})**. "
+        f"Overlay can be **IMERG precipitation rate (NASA GIBS)**.\n\n"
+        "**Model layers (nowcast/forecasts/alerts)** are a v1 heuristic scoring engine (replaceable later)."
+    )
+
     if not show_alerts:
-        st.info("Turn on **Anomaly alerts** in the sidebar to view alerts.")
+        st.warning("Turn on **Anomaly alerts** in the sidebar to view alerts.")
     else:
-        def render_alert_block(title: str, alert_list, zoom_key_prefix: str):
+        def render_alert_list(title: str, items: List[AlertItem], key_prefix: str):
             st.subheader(title)
 
-            for idx, (p, delta, base) in enumerate(alert_list, start=1):
-                label = alert_label(delta)
-                top2 = explain_drivers(p)
+            if len(items) == 0:
+                st.write("No alerts.")
+                return
 
-                # Clean scoring layout
-                r1 = st.container(border=True)
-                with r1:
-                    st.markdown(f"**{idx}. {label}**")
-                    st.caption(f"Lat/Lon: {p[0]:.3f}, {p[1]:.3f}")
+            for idx, a in enumerate(items, start=1):
+                p = a.point
 
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.metric("Delta vs nowcast", f"{delta:+.2f}")
-                    with c2:
-                        st.metric("Forecast total score", f"{p[2]:.2f}")
+                # Clean metrics
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.metric("Delta vs nowcast", f"{a.delta:+.2f}")
+                with c2:
+                    st.metric("Forecast total", f"{p.total:.2f}")
 
-                    # Variable scores (clean + explicit)
-                    s1, s2, s3 = st.columns(3)
-                    with s1:
-                        st.metric("Rainfall", f"{p[4]:.2f}")
-                    with s2:
-                        st.metric("Forage/veg", f"{p[3]:.2f}")
-                    with s3:
-                        st.metric("Access", f"{p[5]:.2f}")
+                # Signal breakdown
+                s1, s2, s3 = st.columns(3)
+                s1.metric("Rainfall", f"{p.rainfall:.2f}")
+                s2.metric("Forage", f"{p.forage:.2f}")
+                s3.metric("Access", f"{p.access:.2f}")
 
-                    st.caption(
-                        f"Top drivers: {top2[0][0]} ({top2[0][1]:.2f}), "
-                        f"{top2[1][0]} ({top2[1][1]:.2f})"
-                    )
+                # Label + location + drivers
+                st.markdown(f"**{idx}. {a.label}**")
+                st.caption(f"Lat/Lon: {p.lat:.3f}, {p.lon:.3f}")
+                st.caption("Top drivers: " + ", ".join([f"{k} ({v:.2f})" for k, v in a.top_drivers]))
 
-                    # Mention real overlays status
-                    overlay_bits = []
-                    if basemap.startswith("MODIS"):
-                        overlay_bits.append("MODIS basemap ON (real)")
-                    if show_imerg and overlay_opacity > 0:
-                        overlay_bits.append("IMERG overlay ON (real)")
-                    if overlay_bits:
-                        st.caption(" | ".join(overlay_bits))
-
-                    # Zoom button (extra zoom button requested)
-                    if st.button(f"Zoom to {title.lower()} alert #{idx}", key=f"{zoom_key_prefix}_{idx}"):
-                        st.session_state["map_center"] = [p[0], p[1]]
-                        st.session_state["map_zoom"] = 9
+                # Buttons (normal zoom + extra zoom closer)
+                b1, b2 = st.columns(2)
+                with b1:
+                    if st.button(f"Zoom to {title.lower()} alert #{idx}", key=f"{key_prefix}_z_{idx}"):
+                        st.session_state.map_center = [p.lat, p.lon]
+                        st.session_state.map_zoom = 9
+                        st.session_state.force_view = True
+                        st.rerun()
+                with b2:
+                    if st.button(f"Zoom closer", key=f"{key_prefix}_zz_{idx}"):
+                        st.session_state.map_center = [p.lat, p.lon]
+                        st.session_state.map_zoom = 11
+                        st.session_state.force_view = True
                         st.rerun()
 
-        render_alert_block("7-day", alerts_7, "z7")
-        st.divider()
-        render_alert_block("30-day", alerts_30, "z30")
+                st.divider()
 
-    st.caption(
-        "Note: The **MODIS True Color** + **IMERG precipitation** layers are **real NASA GIBS tiles**. "
-        "The cow suitability/forecasts are a **v1 heuristic model** you can later replace with a real model."
-    )
+        render_alert_list("7-day", alerts_7, "a7")
+        render_alert_list("30-day", alerts_30, "a30")
