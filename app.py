@@ -151,9 +151,9 @@ m = folium.Map(location=[CENTER_LAT, CENTER_LON], zoom_start=6, tiles=None, cont
 # base layers (so you can actually switch)
 folium.TileLayer("cartodbpositron", name="Street map (Carto)").add_to(m)
 folium.TileLayer(
-    tiles="https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Aqua_CorrectedReflectance_TrueColor/default/default/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg",
-    attr="NASA GIBS (MODIS Aqua True Color)",
-    name="Satellite (MODIS True Color)",
+    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    attr="Esri World Imagery",
+    name="Satellite (Esri World Imagery)",
 ).add_to(m)
 
 # boundary outline
