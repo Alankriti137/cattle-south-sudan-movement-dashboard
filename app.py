@@ -167,12 +167,12 @@ folium.GeoJson(
 # NOTE: these are tile layers served by NASA GIBS. they update over time.
 # URL pattern referenced from common GIBS WMTS usage patterns. :contentReference[oaicite:0]{index=0}
 if show_truecolor:
-folium.TileLayer(
-    tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-    name="Street map (OSM)",
-    overlay=False,
-    control=True
-).add_to(m)
+    folium.TileLayer(
+        tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+        name="Street map (OSM)",
+        overlay=False,
+        control=True
+    ).add_to(m)
 
 if show_precip:
     folium.TileLayer(
