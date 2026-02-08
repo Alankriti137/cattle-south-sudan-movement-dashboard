@@ -1,3 +1,4 @@
+from st_autorefresh import st_autorefresh
 from __future__ import annotations
 
 import io
@@ -22,6 +23,8 @@ from PIL import Image
 # Page
 # ============================================================
 st.set_page_config(page_title="Cattle in South Sudan Movement Dashboard", layout="wide")
+# Auto-refresh the whole app every 2 minutes (pulls new NASA GIBS tiles as they change)
+st_autorefresh(interval=120_000, key="refresh")
 st.title("Cattle in South Sudan Movement Dashboard")
 st.caption("Near-real-time cattle movement suitability, forecasts, and alerts (REAL: NASA GIBS rainfall/vegetation tiles)")
 
@@ -358,8 +361,6 @@ with col_b:
 # ============================================================
 # Auto-refresh (keeps updating without redeploy)
 # ============================================================
-if auto_refresh:
-    st.autorefresh(interval=120_000, key="refresh")  # 2 minutes
 
 
 # ============================================================
