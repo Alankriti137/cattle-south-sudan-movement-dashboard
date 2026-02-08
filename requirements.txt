@@ -5,3 +5,5 @@ geopandas
 shapely
 pandas
 numpy
+requests
+Pillow
