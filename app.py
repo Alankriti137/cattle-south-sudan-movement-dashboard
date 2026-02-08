@@ -170,6 +170,7 @@ if show_truecolor:
     folium.TileLayer(
         tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
         name="Street map (OSM)",
+        attr="© OpenStreetMap contributors",
         overlay=False,
         control=True
     ).add_to(m)
