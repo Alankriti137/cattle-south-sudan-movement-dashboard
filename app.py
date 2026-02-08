@@ -434,151 +434,134 @@ def nearest_alert(click_lat, click_lon, alerts, tol=0.35):
 # ============================================================
 # Layout: map + alerts panel
 # ============================================================
+# ============================================================
+# layout: map + alerts panel (clean + working)
+# ============================================================
 left, right = st.columns([2.2, 1.0], gap="large")
 
 with left:
-    folium_out = st_folium(m, width=None, height=650)
+    folium_out = st_folium(
+        m,
+        width=None,
+        height=650,
+        key="main_map",
+        returned_objects=["center", "zoom", "last_object_clicked"],
+    )
 
-# If user clicked something on the map, try to match it to an alert and "jump" there
+# keep map view stable (fixes weird zoom resets)
+if isinstance(folium_out, dict):
+    if not st.session_state.force_view:
+        c = folium_out.get("center")
+        z = folium_out.get("zoom")
+        if c and "lat" in c and "lng" in c:
+            st.session_state.map_center = [float(c["lat"]), float(c["lng"])]
+        if z is not None:
+            st.session_state.map_zoom = int(z)
+    else:
+        st.session_state.force_view = False
+
+# click -> select nearest alert (works with AlertItem dataclass)
 clicked = (folium_out or {}).get("last_object_clicked")
 if clicked and "lat" in clicked and "lng" in clicked:
     clat, clon = float(clicked["lat"]), float(clicked["lng"])
 
-    # Prefer 7-day alerts first; if none match, try 30-day
-    idx7, p7, d7 = nearest_alert(clat, clon, alerts_7)
-    idx30, p30, d30 = nearest_alert(clat, clon, alerts_30)
+    def _nearest(items):
+        best_idx, best_item, best_d2 = None, None, 1e18
+        for i, a in enumerate(items, start=1):
+            d2 = (a.point.lat - clat) ** 2 + (a.point.lon - clon) ** 2
+            if d2 < best_d2:
+                best_idx, best_item, best_d2 = i, a, d2
+        return best_idx, best_item, best_d2
 
-    if idx7 is not None:
-        st.session_state.selected_kind = "7d"
-        st.session_state.selected_idx = idx7
-        st.session_state.map_center = [p7[0], p7[1]]
-        st.session_state.map_zoom = 9
-        st.rerun()
+    i7, a7, d7 = _nearest(alerts_7)
+    i30, a30, d30 = _nearest(alerts_30)
 
-    elif idx30 is not None:
-        st.session_state.selected_kind = "30d"
-        st.session_state.selected_idx = idx30
-        st.session_state.map_center = [p30[0], p30[1]]
-        st.session_state.map_zoom = 9
-        st.rerun()
-    if map_out and isinstance(map_out, dict):
-        if not st.session_state.force_view:
-            if "center" in map_out and map_out["center"]:
-                st.session_state.map_center = [map_out["center"]["lat"], map_out["center"]["lng"]]
-            if "zoom" in map_out and map_out["zoom"] is not None:
-                st.session_state.map_zoom = int(map_out["zoom"])
-        else:
-            # consume the forced view flag exactly once
-            st.session_state.force_view = False
+    # choose whichever is closer
+    if a7 is not None and (a30 is None or d7 <= d30):
+        chosen_kind, chosen_idx, chosen = "7-day", i7, a7
+    else:
+        chosen_kind, chosen_idx, chosen = "30-day", i30, a30
+
+    # store selection for the right panel
+    st.session_state.selected_alert = {
+        "horizon": chosen_kind,
+        "idx": int(chosen_idx),
+        "lat": float(chosen.point.lat),
+        "lon": float(chosen.point.lon),
+        "delta": float(chosen.delta),
+        "total": float(chosen.point.total),
+        "rain": float(chosen.point.rainfall),
+        "forage": float(chosen.point.forage),
+        "access": float(chosen.point.access),
+        "label": str(chosen.label),
+        "drivers": ", ".join([f"{k} ({v:.2f})" for k, v in chosen.top_drivers]),
+    }
+
+    # zoom to it
+    st.session_state.map_center = [float(chosen.point.lat), float(chosen.point.lon)]
+    st.session_state.map_zoom = 9
+    st.session_state.force_view = True
+    st.rerun()
 
 
 with right:
-    st.header("Alerts")
-    st.caption("Alerts highlight places where forecast suitability increases vs nowcast (delta score).")
-        # --- Part D: Selected-from-map card ---
+    st.header("alerts")
+    st.caption("alerts highlight places where forecast suitability increases vs nowcast (delta score).")
+
+    # selected-from-map card (shows after you click a marker)
     if "selected_alert" in st.session_state:
         sa = st.session_state.selected_alert
-
-        st.markdown("### Selected from map click")
-        st.markdown(
-            f"**{sa['horizon']} alert #{sa['idx']}**  \n"
-            f"Lat/Lon: {sa['lat']:.3f}, {sa['lon']:.3f}"
-        )
+        st.markdown("### selected from map click")
+        st.markdown(f"**{sa['horizon']} alert #{sa['idx']} — {sa['label']}**")
+        st.caption(f"lat/lon: {sa['lat']:.3f}, {sa['lon']:.3f}")
 
         c1, c2 = st.columns(2)
-        with c1:
-            st.metric("Delta vs nowcast", f"{sa['delta']:+.2f}")
-        with c2:
-            st.metric("Forecast total score", f"{sa['score']:.2f}")
+        c1.metric("delta vs nowcast", f"{sa['delta']:+.2f}")
+        c2.metric("forecast total", f"{sa['total']:.2f}")
 
         v1, v2, v3 = st.columns(3)
-        with v1:
-            st.metric("Rainfall (proxy)", f"{sa['rain']:.2f}")
-        with v2:
-            st.metric("Forage/Veg (proxy)", f"{sa['veg']:.2f}")
-        with v3:
-            st.metric("Access/Centrality (proxy)", f"{sa['access']:.2f}")
+        v1.metric("rainfall", f"{sa['rain']:.2f}")
+        v2.metric("forage", f"{sa['forage']:.2f}")
+        v3.metric("access", f"{sa['access']:.2f}")
 
-        st.caption(f"Top drivers: {sa['why']}")
+        st.caption(f"top drivers: {sa['drivers']}")
         st.divider()
 
-def render_alert_card(title, p, delta):
-    # p = (lat, lon, score, veg, rain, access)
-    lat, lon, score, veg, rain, access = p
-    st.markdown(f"### {title}")
-    st.caption(f"Lat/Lon: {lat:.3f}, {lon:.3f}")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.metric("Delta vs nowcast", f"{delta:+.2f}")
-    with c2:
-        st.metric("Forecast total score", f"{score:.2f}")
-
-    c3, c4, c5 = st.columns(3)
-    with c3:
-        st.metric("Rainfall", f"{rain:.2f}")
-    with c4:
-        st.metric("Forage/vegetation", f"{veg:.2f}")
-    with c5:
-        st.metric("Access/centrality", f"{access:.2f}")
-
-    st.caption(f"Top drivers: {explain(p)}")
-    st.divider()
-
-    # Quick “real data” disclosure
-    st.info(
-        f"**Real layers:** Basemap can be Carto / Esri / **MODIS True Color (NASA GIBS, {modis_date})**. "
-        f"Overlay can be **IMERG precipitation rate (NASA GIBS)**.\n\n"
-        "**Model layers (nowcast/forecasts/alerts)** are a v1 heuristic scoring engine (replaceable later)."
-    )
-
     if not show_alerts:
-        st.warning("Turn on **Anomaly alerts** in the sidebar to view alerts.")
+        st.info("turn on 'anomaly alerts' in the sidebar to view alerts.")
     else:
-        def render_alert_list(title: str, items: List[AlertItem], key_prefix: str):
+        def render_list(title: str, items: List[AlertItem], key_prefix: str):
             st.subheader(title)
-
-            if len(items) == 0:
-                st.write("No alerts.")
-                return
-
             for idx, a in enumerate(items, start=1):
-                p = a.point
-
-                # Clean metrics
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.metric("Delta vs nowcast", f"{a.delta:+.2f}")
-                with c2:
-                    st.metric("Forecast total", f"{p.total:.2f}")
-
-                # Signal breakdown
-                s1, s2, s3 = st.columns(3)
-                s1.metric("Rainfall", f"{p.rainfall:.2f}")
-                s2.metric("Forage", f"{p.forage:.2f}")
-                s3.metric("Access", f"{p.access:.2f}")
-
-                # Label + location + drivers
                 st.markdown(f"**{idx}. {a.label}**")
-                st.caption(f"Lat/Lon: {p.lat:.3f}, {p.lon:.3f}")
-                st.caption("Top drivers: " + ", ".join([f"{k} ({v:.2f})" for k, v in a.top_drivers]))
+                st.caption(f"lat/lon: {a.point.lat:.3f}, {a.point.lon:.3f}")
 
-                # Buttons (normal zoom + extra zoom closer)
+                c1, c2 = st.columns(2)
+                c1.metric("delta", f"{a.delta:+.2f}")
+                c2.metric("total", f"{a.point.total:.2f}")
+
+                v1, v2, v3 = st.columns(3)
+                v1.metric("rain", f"{a.point.rainfall:.2f}")
+                v2.metric("forage", f"{a.point.forage:.2f}")
+                v3.metric("access", f"{a.point.access:.2f}")
+
+                st.caption("drivers: " + ", ".join([f"{k} ({v:.2f})" for k, v in a.top_drivers]))
+
                 b1, b2 = st.columns(2)
                 with b1:
-                    if st.button(f"Zoom to {title.lower()} alert #{idx}", key=f"{key_prefix}_z_{idx}"):
-                        st.session_state.map_center = [p.lat, p.lon]
+                    if st.button(f"zoom to {title} alert #{idx}", key=f"{key_prefix}_z_{idx}"):
+                        st.session_state.map_center = [a.point.lat, a.point.lon]
                         st.session_state.map_zoom = 9
                         st.session_state.force_view = True
                         st.rerun()
                 with b2:
-                    if st.button(f"Zoom closer", key=f"{key_prefix}_zz_{idx}"):
-                        st.session_state.map_center = [p.lat, p.lon]
+                    if st.button("zoom closer", key=f"{key_prefix}_zz_{idx}"):
+                        st.session_state.map_center = [a.point.lat, a.point.lon]
                         st.session_state.map_zoom = 11
                         st.session_state.force_view = True
                         st.rerun()
 
                 st.divider()
 
-        render_alert_list("7-day", alerts_7, "a7")
-        render_alert_list("30-day", alerts_30, "a30")
+        render_list("7-day", alerts_7, "a7")
+        render_list("30-day", alerts_30, "a30")
