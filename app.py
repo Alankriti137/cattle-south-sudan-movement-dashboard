@@ -253,7 +253,7 @@ if st.button(f"zoom to 7-day alert #{idx}", key=f"z7_{idx}"):
     st.session_state.map_zoom = 9
     st.rerun()
 st.markdown("### 7-day")
-        for idx, (p, delta) in enumerate(alerts_7, start=1):
+for idx, (p, delta) in enumerate(alerts_7, start=1):
             st.markdown(
                 f"**{idx}. {('new hotspot' if delta > 0.75 else 'route deviation' if delta > 0.45 else 'moderate increase')}**  \n"
                 f"delta: **+{delta:.2f}**  \n"
