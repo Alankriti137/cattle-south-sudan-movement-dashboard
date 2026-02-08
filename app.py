@@ -475,6 +475,32 @@ if clicked and "lat" in clicked and "lng" in clicked:
 with right:
     st.header("Alerts")
     st.caption("Alerts highlight places where forecast suitability increases vs nowcast (delta score).")
+        # --- Part D: Selected-from-map card ---
+    if "selected_alert" in st.session_state:
+        sa = st.session_state.selected_alert
+
+        st.markdown("### Selected from map click")
+        st.markdown(
+            f"**{sa['horizon']} alert #{sa['idx']}**  \n"
+            f"Lat/Lon: {sa['lat']:.3f}, {sa['lon']:.3f}"
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("Delta vs nowcast", f"{sa['delta']:+.2f}")
+        with c2:
+            st.metric("Forecast total score", f"{sa['score']:.2f}")
+
+        v1, v2, v3 = st.columns(3)
+        with v1:
+            st.metric("Rainfall (proxy)", f"{sa['rain']:.2f}")
+        with v2:
+            st.metric("Forage/Veg (proxy)", f"{sa['veg']:.2f}")
+        with v3:
+            st.metric("Access/Centrality (proxy)", f"{sa['access']:.2f}")
+
+        st.caption(f"Top drivers: {sa['why']}")
+        st.divider()
 
 def render_alert_card(title, p, delta):
     # p = (lat, lon, score, veg, rain, access)
