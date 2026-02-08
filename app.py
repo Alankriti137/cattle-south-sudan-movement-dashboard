@@ -1,6 +1,16 @@
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
+from datetime import timedelta
+
+def pick_modis_date(max_back_days=2):
+    base = datetime.now(timezone.utc).date()
+    for k in range(0, max_back_days + 1):
+        d = (base - timedelta(days=k)).strftime("%Y-%m-%d")
+        yield d
+
+modis_date = next(pick_modis_date())  # today first; you can add tile-check later
+modis_url = make_gibs_modis_truecolor_url(modis_date)
 from typing import List, Tuple, Optional, Dict
 
 import numpy as np
@@ -252,6 +262,20 @@ if "selected_info" not in st.session_state:
 st.sidebar.header("Layers")
 
 basemap_choice = st.sidebar.radio(
+    # --- MODIS date picker (REAL NASA GIBS daily imagery) ---
+modis_day_choice = st.sidebar.radio(
+    "MODIS date",
+    options=["Today", "Yesterday", "2 days ago"],
+    index=0,
+)
+
+base_date = datetime.now(timezone.utc).date()
+if modis_day_choice == "Today":
+    modis_date = base_date.strftime("%Y-%m-%d")
+elif modis_day_choice == "Yesterday":
+    modis_date = (base_date - timedelta(days=1)).strftime("%Y-%m-%d")
+else:
+    modis_date = (base_date - timedelta(days=2)).strftime("%Y-%m-%d")
     "Basemap",
     options=[
         "Street map (Carto)",
@@ -332,6 +356,19 @@ m = folium.Map(
     control_scale=True,
     prefer_canvas=True,
 )
+# --- MODIS date picker (REAL: NASA GIBS daily tiles) ---
+st.sidebar.subheader("MODIS date (NASA GIBS)")
+modis_day = st.sidebar.radio(
+    "MODIS imagery day",
+    ["Today", "Yesterday", "2 Days Ago"],
+    index=0,
+    horizontal=True,
+)
+
+# Pick the actual date string for the GIBS URL
+days_back = {"Today": 0, "Yesterday": 1, "2 Days Ago": 2}[modis_day]
+modis_date = (datetime.now(timezone.utc) - np.timedelta64(days_back, "D")).astype("datetime64[D]")
+modis_date = str(modis_date)  # 'YYYY-MM-DD'
 
 # Basemaps
 folium.TileLayer(
