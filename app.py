@@ -24,6 +24,12 @@ def top_hotspots(points, k=5):
 from folium.plugins import HeatMap
 
 st.set_page_config(
+    st.sidebar.header("Layers")
+
+show_nowcast = st.sidebar.checkbox("Nowcast (current)", True)
+show_7d = st.sidebar.checkbox("Forecast (7 days)", False)
+show_30d = st.sidebar.checkbox("Forecast (30 days)", False)
+show_alerts = st.sidebar.checkbox("Anomaly alerts", False)
     page_title="Cattle in South Sudan Movement Dashboard",
     layout="wide"
 )
@@ -40,6 +46,38 @@ show_anom = st.sidebar.checkbox("Anomaly alerts")
 
 # load south sudan boundary
 gdf = gpd.read_file("data/south_sudan.geojson.json")
+# --- DEMO DATA (replace later with real model outputs) ---
+
+nowcast_points = [
+    [7.1, 30.4],
+    [7.2, 30.6],
+    [6.9, 29.8],
+]
+
+forecast_7d_points = [
+    [7.3, 30.8],
+    [7.0, 30.2],
+]
+
+forecast_30d_points = [
+    [7.6, 31.0],
+    [6.7, 29.5],
+]
+
+alerts = [
+    {
+        "lat": 7.092,
+        "lon": 30.510,
+        "score": 0.98,
+        "reason": "High vegetation and nearby water sources"
+    },
+    {
+        "lat": 6.990,
+        "lon": 29.765,
+        "score": 0.92,
+        "reason": "Unusual cattle concentration for this season"
+    }
+]
 gdf = gdf.to_crs(epsg=4326)
 
 # map
@@ -78,7 +116,51 @@ if show_nowcast:
     bounds = tuple(gdf.total_bounds)
     geom_wkt = gdf.geometry.unary_union.wkt
     points = build_nowcast_points(bounds, geom_wkt)
-    HeatMap(points, name="Nowcast heatmap").add_to(m)
+ # --- MAP LAYERS ---
+
+if show_nowcast:
+    HeatMap(
+        nowcast_points,
+        radius=35,
+        blur=25,
+        min_opacity=0.4,
+        name="Nowcast"
+    ).add_to(m)
+
+if show_7d:
+    HeatMap(
+        forecast_7d_points,
+        radius=30,
+        blur=22,
+        min_opacity=0.35,
+        name="7-day Forecast"
+    ).add_to(m)
+
+if show_30d:
+    HeatMap(
+        forecast_30d_points,
+        radius=30,
+        blur=22,
+        min_opacity=0.35,
+        name="30-day Forecast"
+    ).add_to(m)
+
+if show_alerts:
+    for alert in alerts:
+        folium.CircleMarker(
+            location=[alert["lat"], alert["lon"]],
+            radius=14,          # BIGGER markers
+            color="black",
+            weight=2,
+            fill=True,
+            fill_color="yellow",
+            fill_opacity=0.9,
+            popup=f"""
+            <b>Hotspot</b><br>
+            Score: {alert['score']}<br>
+            Reason: {alert['reason']}
+            """
+        ).add_to(m)
 
 if show_fc7:
     folium.Marker([8.0, 30.0], tooltip="7-day forecast placeholder").add_to(m)
