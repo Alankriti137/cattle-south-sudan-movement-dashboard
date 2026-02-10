@@ -4,6 +4,9 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Tuple, Optional, Dict
 
 import numpy as np
+import json
+import urllib.request
+import urllib.parse
 import geopandas as gpd
 import streamlit as st
 import folium
@@ -234,6 +237,213 @@ south_sudan_geojson = gdf.__geo_interface__
 centroid = gdf.unary_union.centroid
 CENTER_LAT, CENTER_LON = float(centroid.y), float(centroid.x)
 
+# ============================================================
+# REAL-ONLY engine (Open-Meteo daily) — no API key
+# Produces:
+#   - nowcast score = last 7 days observed
+#   - 7-day forecast score = next 7 days forecast
+#   - 30-day trend score = last 30 days observed
+# ============================================================
+
+def clamp01(x: float) -> float:
+    return float(max(0.0, min(1.0, x)))
+
+def normalize(x: float, lo: float, hi: float) -> float:
+    if hi <= lo:
+        return 0.0
+    return clamp01((x - lo) / (hi - lo))
+
+def safe_mean(xs):
+    xs = [x for x in xs if x is not None]
+    return float(sum(xs) / len(xs)) if xs else 0.0
+
+def safe_sum(xs):
+    xs = [x for x in xs if x is not None]
+    return float(sum(xs)) if xs else 0.0
+
+@st.cache_data(ttl=60 * 60)  # cache 1 hour to avoid hammering API
+def fetch_open_meteo_daily(lat: float, lon: float, past_days: int = 30, forecast_days: int = 7) -> dict:
+    """
+    Returns daily arrays with observed past_days + forecast forecast_days.
+    Uses Open-Meteo forecast endpoint (no key).
+    """
+    base = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": f"{lat:.4f}",
+        "longitude": f"{lon:.4f}",
+        "daily": "precipitation_sum,temperature_2m_mean",
+        "past_days": str(past_days),
+        "forecast_days": str(forecast_days),
+        "timezone": "UTC",
+    }
+    url = base + "?" + urllib.parse.urlencode(params)
+    with urllib.request.urlopen(url, timeout=20) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+def score_from_real_weather(obs_rain_7, obs_tmean_7, fc_rain_7, fc_tmean_7, obs_rain_30, obs_tmean_30):
+    """
+    All inputs are REAL (Open-Meteo).
+    We convert them to 0..1 scores:
+      - water = rainfall
+      - comfort = inverse heat stress from mean temperature
+    """
+    # rainfall scoring (mm)
+    water_7 = normalize(obs_rain_7, 0.0, 70.0)
+    water_fc7 = normalize(fc_rain_7, 0.0, 70.0)
+    water_30 = normalize(obs_rain_30, 0.0, 200.0)
+
+    # temperature comfort (C) — higher temp => lower comfort
+    comfort_7 = 1.0 - normalize(obs_tmean_7, 28.0, 42.0)
+    comfort_fc7 = 1.0 - normalize(fc_tmean_7, 28.0, 42.0)
+    comfort_30 = 1.0 - normalize(obs_tmean_30, 28.0, 42.0)
+
+    now_total = clamp01(0.60 * water_7 + 0.40 * comfort_7)
+    fc7_total = clamp01(0.60 * water_fc7 + 0.40 * comfort_fc7)
+    trend30_total = clamp01(0.60 * water_30 + 0.40 * comfort_30)
+
+    features = {
+        "obs_rain_7": float(obs_rain_7),
+        "obs_tmean_7": float(obs_tmean_7),
+        "fc_rain_7": float(fc_rain_7),
+        "fc_tmean_7": float(fc_tmean_7),
+        "obs_rain_30": float(obs_rain_30),
+        "obs_tmean_30": float(obs_tmean_30),
+        "water_7": float(water_7),
+        "comfort_7": float(comfort_7),
+        "water_fc7": float(water_fc7),
+        "comfort_fc7": float(comfort_fc7),
+        "water_30": float(water_30),
+        "comfort_30": float(comfort_30),
+    }
+    return now_total, fc7_total, trend30_total, features
+
+def top_reasons_from_features(f: dict, horizon: str) -> list[tuple[str, float]]:
+    """
+    horizon: "now", "fc7", "trend30"
+    """
+    if horizon == "now":
+        drivers = [("Rainfall (7d)", f["water_7"]), ("Heat comfort (7d)", f["comfort_7"])]
+    elif horizon == "fc7":
+        drivers = [("Forecast rainfall (next 7d)", f["water_fc7"]), ("Forecast heat comfort (next 7d)", f["comfort_fc7"])]
+    else:
+        drivers = [("Rainfall (30d)", f["water_30"]), ("Heat comfort (30d)", f["comfort_30"])]
+
+    drivers.sort(key=lambda t: t[1], reverse=True)
+    return drivers
+
+def label_from_delta(delta: float) -> str:
+    # Labels will vary because delta varies (real data), not always identical
+    if delta >= 0.30:
+        return "Strong improvement expected"
+    if delta >= 0.15:
+        return "Moderate improvement expected"
+    if delta >= 0.05:
+        return "Slight improvement expected"
+    if delta <= -0.15:
+        return "Conditions worsening"
+    return "Small change"
+
+def build_points_real(gdf: gpd.GeoDataFrame, step_deg: float = 0.9, keep_n: int = 30):
+    """
+    Grid sample points INSIDE South Sudan and score using REAL Open-Meteo daily.
+    Returns list of dicts with:
+      lat, lon, now_total, fc7_total, trend30_total, features
+    """
+    minx, miny, maxx, maxy = gdf.total_bounds
+    poly = gdf.unary_union
+
+    pts = []
+    lats = np.arange(miny, maxy, step_deg)
+    lons = np.arange(minx, maxx, step_deg)
+
+    for lat in lats:
+        for lon in lons:
+            lat = float(lat); lon = float(lon)
+
+            try:
+                if not poly.contains(gpd.points_from_xy([lon], [lat])[0]):
+                    continue
+            except Exception:
+                pass
+
+            wx = fetch_open_meteo_daily(lat, lon, past_days=30, forecast_days=7)
+            daily = wx.get("daily", {})
+            precip = daily.get("precipitation_sum", []) or []
+            tmean = daily.get("temperature_2m_mean", []) or []
+
+            # daily arrays contain (past_days + forecast_days)
+            # last 7 observed are the last 7 of the "past" window -> we take the slice that corresponds to "past period end"
+            # simplest stable assumption: Open-Meteo returns past days first, then forecast days.
+            past_len = min(len(precip), 30)  # expected 30
+            obs_precip = precip[:past_len]
+            obs_tmean = tmean[:past_len]
+            fc_precip = precip[past_len:past_len + 7]
+            fc_tmean = tmean[past_len:past_len + 7]
+
+            obs_rain_7 = safe_sum(obs_precip[-7:])
+            obs_tmean_7 = safe_mean(obs_tmean[-7:])
+            fc_rain_7 = safe_sum(fc_precip[:7])
+            fc_tmean_7 = safe_mean(fc_tmean[:7])
+
+            obs_rain_30 = safe_sum(obs_precip[-30:])
+            obs_tmean_30 = safe_mean(obs_tmean[-30:])
+
+            now_total, fc7_total, trend30_total, features = score_from_real_weather(
+                obs_rain_7, obs_tmean_7,
+                fc_rain_7, fc_tmean_7,
+                obs_rain_30, obs_tmean_30,
+            )
+
+            pts.append({
+                "lat": lat,
+                "lon": lon,
+                "now_total": now_total,
+                "fc7_total": fc7_total,
+                "trend30_total": trend30_total,
+                "features": features,
+            })
+
+    # rank by nowcast by default (you can change)
+    pts.sort(key=lambda p: p["now_total"], reverse=True)
+    return pts[:keep_n]
+
+def compute_alerts_real(points, k: int = 6):
+    """
+    Alerts = biggest improvement from now -> next 7 days forecast
+    """
+    scored = []
+    for p in points:
+        delta = float(p["fc7_total"] - p["now_total"])
+        scored.append((p, delta))
+    scored.sort(key=lambda t: t[1], reverse=True)
+    out = []
+    for p, delta in scored[:k]:
+        f = p["features"]
+        reasons = top_reasons_from_features(f, "fc7")
+        out.append({
+            "lat": p["lat"],
+            "lon": p["lon"],
+            "delta": delta,
+            "now_total": p["now_total"],
+            "fc7_total": p["fc7_total"],
+            "trend30_total": p["trend30_total"],
+            "features": f,
+            "label": label_from_delta(delta),
+            "reasons": reasons,
+        })
+    return out
+
+def nearest_alert(lat: float, lon: float, alerts: list[dict], tol_deg: float = 0.7):
+    best = None
+    best_d2 = 1e18
+    for idx, a in enumerate(alerts, start=1):
+        d2 = (a["lat"] - lat) ** 2 + (a["lon"] - lon) ** 2
+        if d2 < best_d2:
+            best_d2 = d2
+            best = (idx, a)
+    if best and best_d2 <= (tol_deg ** 2):
+        return best[0], best[1]
+    return None, None
 
 # ============================================================
 # Session state (fix “weird zoom” / blinking)
@@ -326,13 +536,13 @@ if auto_refresh:
 # ============================================================
 # Generate points (weekly changes)
 # ============================================================
-week_seed = int(datetime.now(timezone.utc).strftime("%Y%U"))
-now_pts = make_points(week_seed, gdf, CENTER_LAT, CENTER_LON)
-fc7_pts = make_points(week_seed + 7, gdf, CENTER_LAT, CENTER_LON)
-fc30_pts = make_points(week_seed + 30, gdf, CENTER_LAT, CENTER_LON)
+points = build_points_real(gdf, step_deg=0.9, keep_n=30)
 
-alerts_7 = compute_alerts(now_pts, fc7_pts, k=6)
-alerts_30 = compute_alerts(now_pts, fc30_pts, k=6)
+# These are real-only outputs:
+# - Nowcast = last 7 days observed
+# - 7-day forecast = next 7 days forecast
+# - 30-day trend = last 30 days observed
+alerts_7 = compute_alerts_real(points, k=6)
 
 
 # ============================================================
@@ -466,7 +676,15 @@ left, right = st.columns([2.2, 1.0], gap="large")
 
 with left:
     map_out = st_folium(m, width=None, height=650)
-
+clicked = (map_out or {}).get("last_object_clicked")
+if clicked and "lat" in clicked and "lng" in clicked:
+    clat, clon = float(clicked["lat"]), float(clicked["lng"])
+    idx, a = nearest_alert(clat, clon, alerts_7, tol_deg=0.7)
+    if idx is not None:
+        st.session_state.selected_alert = {"idx": idx, **a}
+        st.session_state.map_center = [a["lat"], a["lon"]]
+        st.session_state.map_zoom = 9
+        st.rerun()
 # Persist user pan/zoom (this is what stops “weird zoom”)
 if isinstance(map_out, dict):
     # Keep view updated from user interactions
@@ -547,7 +765,22 @@ def alert_card(title: str, idx: int, a: AlertItem, key_prefix: str):
 with right:
     st.header("Alerts")
     st.caption("Alerts highlight places where forecast suitability increases vs nowcast (delta score).")
+    # --- Selected-from-map / selected alert (Part D) ---
+    si = st.session_state.get("selected_info")
+    if si:
+        st.subheader("Selected marker")
+        st.caption(f"{si['layer']} • point #{si['idx']} • Lat/Lon: {si['lat']:.3f}, {si['lon']:.3f}")
 
+        c1, c2 = st.columns(2)
+        c1.metric("Total score", f"{si['total']:.2f}")
+        c2.metric("Top drivers", ", ".join([f"{k} ({v:.2f})" for k, v in si["drivers"]]))
+
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Rainfall", f"{si['rainfall']:.2f}")
+        s2.metric("Forage", f"{si['forage']:.2f}")
+        s3.metric("Access", f"{si['access']:.2f}")
+
+        st.divider()
     # Selected marker info
     if st.session_state.selected_info is not None:
         si = st.session_state.selected_info
