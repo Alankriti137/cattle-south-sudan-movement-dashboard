@@ -512,7 +512,13 @@ folium.LayerControl(collapsed=False).add_to(m)
 left, right = st.columns([2.2, 1.0], gap="large")
 
 with left:
-    map_out = st_folium(m, width=None, height=650)
+    map_out = st_folium(
+    m,
+    width=None,
+    height=650,
+    key="main_map",                       # IMPORTANT: stable key
+    returned_objects=["last_object_clicked", "center", "zoom"],
+)
 
 # persist view
 if isinstance(map_out, dict) and map_out.get("center") and map_out.get("zoom") is not None:
