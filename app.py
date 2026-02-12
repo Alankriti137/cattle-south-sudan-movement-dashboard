@@ -13,22 +13,6 @@ import folium
 from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 
-if isinstance(map_out, dict):
-    new_center = map_out.get("center")
-    new_zoom = map_out.get("zoom")
-
-    if new_center and new_zoom is not None:
-        old_center = st.session_state.get("map_center", [CENTER_LAT, CENTER_LON])
-        old_zoom = st.session_state.get("map_zoom", 6)
-
-        # only update if it actually changed enough
-        moved = (abs(new_center["lat"] - old_center[0]) > 1e-4) or (abs(new_center["lng"] - old_center[1]) > 1e-4)
-        zoomed = (int(new_zoom) != int(old_zoom))
-
-        if moved or zoomed:
-            st.session_state.map_center = [new_center["lat"], new_center["lng"]]
-            st.session_state.map_zoom = int(new_zoom)
-
 # ============================================================
 # Page config
 # ============================================================
@@ -528,19 +512,31 @@ left, right = st.columns([2.2, 1.0], gap="large")
 
 with left:
     map_out = st_folium(
-    m,
-    width=None,
-    height=650,
-    key="main_map",                       # IMPORTANT: stable key
-    returned_objects=["last_object_clicked", "center", "zoom"],
-)
+        m,
+        width=None,
+        height=650,
+        key="main_map",  # stable key (prevents re-mount flicker)
+    )
 
-# persist view
-if isinstance(map_out, dict) and map_out.get("center") and map_out.get("zoom") is not None:
-    st.session_state.map_center = [map_out["center"]["lat"], map_out["center"]["lng"]]
-    st.session_state.map_zoom = int(map_out["zoom"])
+# ---------- Persist user pan/zoom (GUARDED) ----------
+if isinstance(map_out, dict):
+    new_center = map_out.get("center")
+    new_zoom = map_out.get("zoom")
 
-# click -> match to nearest ALERT (not any point)
+    if new_center and (new_zoom is not None):
+        old_center = st.session_state.get("map_center", [CENTER_LAT, CENTER_LON])
+        old_zoom = st.session_state.get("map_zoom", 6)
+
+        moved = (abs(new_center["lat"] - old_center[0]) > 1e-4) or (abs(new_center["lng"] - old_center[1]) > 1e-4)
+        zoomed = (int(new_zoom) != int(old_zoom))
+
+        # IMPORTANT: don't overwrite center/zoom if we are about to force-zoom to an alert
+        # (this prevents the “bounce”)
+        if (st.session_state.get("pending_zoom_to_alert") is not True) and (moved or zoomed):
+            st.session_state.map_center = [new_center["lat"], new_center["lng"]]
+            st.session_state.map_zoom = int(new_zoom)
+
+# ---------- Click -> match to nearest ALERT ----------
 clicked = (map_out or {}).get("last_object_clicked")
 if clicked and "lat" in clicked and "lng" in clicked:
     clat, clon = float(clicked["lat"]), float(clicked["lng"])
@@ -549,8 +545,12 @@ if clicked and "lat" in clicked and "lng" in clicked:
         st.session_state.selected_alert = {"idx": idx, **a}
         st.session_state.map_center = [a["lat"], a["lon"]]
         st.session_state.map_zoom = 9
+        st.session_state.pending_zoom_to_alert = True
         st.rerun()
 
+# consume the pending flag after rerun completes
+if st.session_state.get("pending_zoom_to_alert"):
+    st.session_state.pending_zoom_to_alert = False
 
 # ============================================================
 # Right panel
