@@ -512,11 +512,12 @@ left, right = st.columns([2.2, 1.0], gap="large")
 
 with left:
     map_out = st_folium(
-        m,
-        width=None,
-        height=650,
-        key="main_map",  # stable key (prevents re-mount flicker)
-    )
+    m,
+    width=None,
+    height=650,
+    key="main_map",
+    returned_objects=["last_object_clicked", "center", "zoom"],
+)
 
 # ---------- Persist user pan/zoom (GUARDED) ----------
 if isinstance(map_out, dict):
@@ -526,6 +527,9 @@ if isinstance(map_out, dict):
     if new_center and (new_zoom is not None):
         old_center = st.session_state.get("map_center", [CENTER_LAT, CENTER_LON])
         old_zoom = st.session_state.get("map_zoom", 6)
+
+    if "pending_zoom_to_alert" not in st.session_state:
+        st.session_state.pending_zoom_to_alert = False
 
         moved = (abs(new_center["lat"] - old_center[0]) > 1e-4) or (abs(new_center["lng"] - old_center[1]) > 1e-4)
         zoomed = (int(new_zoom) != int(old_zoom))
