@@ -13,6 +13,21 @@ import folium
 from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 
+if isinstance(map_out, dict):
+    new_center = map_out.get("center")
+    new_zoom = map_out.get("zoom")
+
+    if new_center and new_zoom is not None:
+        old_center = st.session_state.get("map_center", [CENTER_LAT, CENTER_LON])
+        old_zoom = st.session_state.get("map_zoom", 6)
+
+        # only update if it actually changed enough
+        moved = (abs(new_center["lat"] - old_center[0]) > 1e-4) or (abs(new_center["lng"] - old_center[1]) > 1e-4)
+        zoomed = (int(new_zoom) != int(old_zoom))
+
+        if moved or zoomed:
+            st.session_state.map_center = [new_center["lat"], new_center["lng"]]
+            st.session_state.map_zoom = int(new_zoom)
 
 # ============================================================
 # Page config
