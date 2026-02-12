@@ -1,12 +1,12 @@
 import math
-from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any
 
-import numpy as np
 import json
 import urllib.request
 import urllib.parse
+
+import numpy as np
 import geopandas as gpd
 import streamlit as st
 import folium
@@ -17,16 +17,13 @@ from streamlit_folium import st_folium
 # ============================================================
 # Page config
 # ============================================================
-st.set_page_config(
-    page_title="Cattle in South Sudan Movement Dashboard",
-    layout="wide",
-)
+st.set_page_config(page_title="Cattle in South Sudan Movement Dashboard", layout="wide")
 
 TITLE = "Cattle in South Sudan Movement Dashboard"
-CAPTION = "Near-real-time cattle movement suitability, forecasts, and alerts (REAL: NASA GIBS tiles for rainfall/imagery)"
+CAPTION = "REAL drivers only: Open-Meteo (rain/temp) + NASA GIBS (imagery/IMERG tiles)"
 BOUNDARY_PATH = "data/south_sudan.geojson.json"
 
-# Real basemaps / tiles
+# Basemaps / tiles (REAL)
 CARTO = "cartodbpositron"
 ESRI_WORLD_IMAGERY = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
 
@@ -51,17 +48,27 @@ def load_boundary(path: str) -> gpd.GeoDataFrame:
     return gdf
 
 
-def yyyy_mm_dd_utc(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
+def clamp01(x: float) -> float:
+    return float(max(0.0, min(1.0, x)))
 
 
-def modis_date_string() -> str:
-    # Using "yesterday" avoids "today tiles not published yet" problems.
-    return yyyy_mm_dd_utc(datetime.now(timezone.utc) - timedelta(days=1))
+def normalize(x: float, lo: float, hi: float) -> float:
+    if hi <= lo:
+        return 0.0
+    return clamp01((x - lo) / (hi - lo))
+
+
+def safe_mean(xs):
+    xs = [x for x in xs if x is not None]
+    return float(sum(xs) / len(xs)) if xs else 0.0
+
+
+def safe_sum(xs):
+    xs = [x for x in xs if x is not None]
+    return float(sum(xs)) if xs else 0.0
 
 
 def make_gibs_modis_truecolor_url(date_str: str) -> str:
-    # WMTS GoogleMapsCompatible levels; Level9 is fairly detailed.
     return (
         "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/"
         f"{GIBS_MODIS_TRUECOLOR_LAYER}/default/{date_str}/"
@@ -70,7 +77,6 @@ def make_gibs_modis_truecolor_url(date_str: str) -> str:
 
 
 def make_gibs_imerg_url() -> str:
-    # Near-real-time tiles (no explicit date)
     return (
         "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/"
         f"{GIBS_IMERG_LAYER}/default/default/"
@@ -78,195 +84,11 @@ def make_gibs_imerg_url() -> str:
     )
 
 
-def clamp01(x: float) -> float:
-    return float(max(0.0, min(1.0, x)))
-
-
 # ============================================================
-# Simple demo engine (NOT real cattle telemetry)
-# - Real NASA tiles are in basemap/overlay
-# - These scores are a placeholder "suitability" heuristic
-#   until you connect a real model/data pipeline.
+# REAL weather fetch (Open-Meteo) — cached
 # ============================================================
-@dataclass(frozen=True)
-class ScoredPoint:
-    lat: float
-    lon: float
-    total: float
-    rainfall: float
-    forage: float
-    access: float
-
-
-@dataclass(frozen=True)
-class AlertItem:
-    point: ScoredPoint
-    delta: float
-    label: str
-    drivers: List[Tuple[str, float]]  # sorted high->low
-
-
-def make_points(
-    seed: int,
-    gdf: gpd.GeoDataFrame,
-    center_lat: float,
-    center_lon: float,
-    step_deg: float = 0.6,
-    keep_n: int = 35,
-) -> List[ScoredPoint]:
-    rng = np.random.default_rng(seed)
-    minx, miny, maxx, maxy = gdf.total_bounds
-    poly = gdf.unary_union
-
-    points: List[ScoredPoint] = []
-    lats = np.arange(miny, maxy, step_deg)
-    lons = np.arange(minx, maxx, step_deg)
-
-    for lat in lats:
-        for lon in lons:
-            jlat = float(lat + rng.uniform(-0.12, 0.12))
-            jlon = float(lon + rng.uniform(-0.12, 0.12))
-
-            # keep only inside boundary
-            try:
-                pt = gpd.points_from_xy([jlon], [jlat])[0]
-                if not poly.contains(pt):
-                    continue
-            except Exception:
-                pass
-
-            # --- proxy signals (0..1) ---
-            # rainfall proxy: stable randomness per seed
-            rainfall = float(rng.random())
-
-            # forage proxy: encourages band near centroid latitude
-            forage = float(1.0 - min(1.0, abs(jlat - center_lat) / 6.0))
-
-            # access proxy: closeness to centroid
-            access = float(1.0 - min(1.0, (abs(jlat - center_lat) + abs(jlon - center_lon)) / 10.0))
-
-            total = 0.45 * forage + 0.35 * rainfall + 0.20 * access
-
-            points.append(
-                ScoredPoint(
-                    lat=jlat,
-                    lon=jlon,
-                    total=clamp01(total),
-                    rainfall=clamp01(rainfall),
-                    forage=clamp01(forage),
-                    access=clamp01(access),
-                )
-            )
-
-    points.sort(key=lambda p: p.total, reverse=True)
-    return points[:keep_n]
-
-
-def top_drivers(p: ScoredPoint, n: int = 2) -> List[Tuple[str, float]]:
-    drivers = [
-        ("Rainfall", p.rainfall),
-        ("Forage/Vegetation", p.forage),
-        ("Access", p.access),
-    ]
-    drivers.sort(key=lambda t: t[1], reverse=True)
-    return drivers[:n]
-
-
-def label_from_delta(delta: float) -> str:
-    # Vary labels so they don't all say the same thing
-    if delta >= 0.70:
-        return "New hotspot likely forming"
-    if delta >= 0.45:
-        return "Movement shift likely"
-    if delta >= 0.25:
-        return "Moderate increase"
-    return "Small increase"
-
-
-def compute_alerts(now_pts: List[ScoredPoint], fc_pts: List[ScoredPoint], k: int = 6) -> List[AlertItem]:
-    # coarse matching by rounded coordinates
-    now_index: Dict[Tuple[float, float], ScoredPoint] = {(round(p.lat, 1), round(p.lon, 1)): p for p in now_pts}
-
-    diffs: List[Tuple[ScoredPoint, float]] = []
-    for p in fc_pts:
-        key = (round(p.lat, 1), round(p.lon, 1))
-        if key in now_index:
-            delta = p.total - now_index[key].total
-        else:
-            delta = p.total  # "new" hotspot relative to nowcast
-        diffs.append((p, float(delta)))
-
-    diffs.sort(key=lambda t: t[1], reverse=True)
-    diffs = diffs[:k]
-
-    alerts: List[AlertItem] = []
-    for p, delta in diffs:
-        alerts.append(
-            AlertItem(
-                point=p,
-                delta=delta,
-                label=label_from_delta(delta),
-                drivers=top_drivers(p, n=2),
-            )
-        )
-    return alerts
-
-
-def nearest_point(lat: float, lon: float, pts: List[ScoredPoint]) -> Tuple[Optional[int], Optional[ScoredPoint], float]:
-    best_idx = None
-    best_p = None
-    best_d2 = 1e18
-    for i, p in enumerate(pts):
-        d2 = (p.lat - lat) ** 2 + (p.lon - lon) ** 2
-        if d2 < best_d2:
-            best_d2 = d2
-            best_idx = i
-            best_p = p
-    return best_idx, best_p, float(best_d2)
-
-
-# ============================================================
-# UI: Header
-# ============================================================
-st.title(TITLE)
-st.caption(CAPTION)
-
-gdf = load_boundary(BOUNDARY_PATH)
-south_sudan_geojson = gdf.__geo_interface__
-
-centroid = gdf.unary_union.centroid
-CENTER_LAT, CENTER_LON = float(centroid.y), float(centroid.x)
-
-# ============================================================
-# REAL-ONLY engine (Open-Meteo daily) — no API key
-# Produces:
-#   - nowcast score = last 7 days observed
-#   - 7-day forecast score = next 7 days forecast
-#   - 30-day trend score = last 30 days observed
-# ============================================================
-
-def clamp01(x: float) -> float:
-    return float(max(0.0, min(1.0, x)))
-
-def normalize(x: float, lo: float, hi: float) -> float:
-    if hi <= lo:
-        return 0.0
-    return clamp01((x - lo) / (hi - lo))
-
-def safe_mean(xs):
-    xs = [x for x in xs if x is not None]
-    return float(sum(xs) / len(xs)) if xs else 0.0
-
-def safe_sum(xs):
-    xs = [x for x in xs if x is not None]
-    return float(sum(xs)) if xs else 0.0
-
-@st.cache_data(ttl=60 * 60)  # cache 1 hour to avoid hammering API
+@st.cache_data(ttl=60 * 60, show_spinner=False)
 def fetch_open_meteo_daily(lat: float, lon: float, past_days: int = 30, forecast_days: int = 7) -> dict:
-    """
-    Returns daily arrays with observed past_days + forecast forecast_days.
-    Uses Open-Meteo forecast endpoint (no key).
-    """
     base = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": f"{lat:.4f}",
@@ -280,19 +102,27 @@ def fetch_open_meteo_daily(lat: float, lon: float, past_days: int = 30, forecast
     with urllib.request.urlopen(url, timeout=20) as r:
         return json.loads(r.read().decode("utf-8"))
 
-def score_from_real_weather(obs_rain_7, obs_tmean_7, fc_rain_7, fc_tmean_7, obs_rain_30, obs_tmean_30):
+
+def score_from_real_weather(
+    obs_rain_7: float,
+    obs_tmean_7: float,
+    fc_rain_7: float,
+    fc_tmean_7: float,
+    obs_rain_30: float,
+    obs_tmean_30: float,
+) -> Tuple[float, float, float, Dict[str, float]]:
     """
     All inputs are REAL (Open-Meteo).
-    We convert them to 0..1 scores:
-      - water = rainfall
-      - comfort = inverse heat stress from mean temperature
+    Converts to 0..1 suitability scores:
+      - water = rainfall (more is better up to a cap)
+      - comfort = temperature comfort (cooler is better past a threshold)
     """
     # rainfall scoring (mm)
     water_7 = normalize(obs_rain_7, 0.0, 70.0)
     water_fc7 = normalize(fc_rain_7, 0.0, 70.0)
     water_30 = normalize(obs_rain_30, 0.0, 200.0)
 
-    # temperature comfort (C) — higher temp => lower comfort
+    # temperature comfort (C) — higher => worse comfort
     comfort_7 = 1.0 - normalize(obs_tmean_7, 28.0, 42.0)
     comfort_fc7 = 1.0 - normalize(fc_tmean_7, 28.0, 42.0)
     comfort_30 = 1.0 - normalize(obs_tmean_30, 28.0, 42.0)
@@ -317,22 +147,27 @@ def score_from_real_weather(obs_rain_7, obs_tmean_7, fc_rain_7, fc_tmean_7, obs_
     }
     return now_total, fc7_total, trend30_total, features
 
-def top_reasons_from_features(f: dict, horizon: str) -> list[tuple[str, float]]:
+
+def top_reasons(features: Dict[str, float], mode: str) -> List[Tuple[str, float]]:
     """
-    horizon: "now", "fc7", "trend30"
+    mode: "now" | "fc7" | "trend30"
+    Returns 2 drivers (score contributions) so reasons differ per point.
     """
-    if horizon == "now":
-        drivers = [("Rainfall (7d)", f["water_7"]), ("Heat comfort (7d)", f["comfort_7"])]
-    elif horizon == "fc7":
-        drivers = [("Forecast rainfall (next 7d)", f["water_fc7"]), ("Forecast heat comfort (next 7d)", f["comfort_fc7"])]
+    if mode == "now":
+        drivers = [("Rainfall (past 7d)", features["water_7"]), ("Heat comfort (past 7d)", features["comfort_7"])]
+    elif mode == "fc7":
+        drivers = [
+            ("Forecast rainfall (next 7d)", features["water_fc7"]),
+            ("Forecast heat comfort (next 7d)", features["comfort_fc7"]),
+        ]
     else:
-        drivers = [("Rainfall (30d)", f["water_30"]), ("Heat comfort (30d)", f["comfort_30"])]
+        drivers = [("Rainfall (past 30d)", features["water_30"]), ("Heat comfort (past 30d)", features["comfort_30"])]
 
     drivers.sort(key=lambda t: t[1], reverse=True)
-    return drivers
+    return drivers[:2]
+
 
 def label_from_delta(delta: float) -> str:
-    # Labels will vary because delta varies (real data), not always identical
     if delta >= 0.30:
         return "Strong improvement expected"
     if delta >= 0.15:
@@ -343,23 +178,30 @@ def label_from_delta(delta: float) -> str:
         return "Conditions worsening"
     return "Small change"
 
-def build_points_real(gdf: gpd.GeoDataFrame, step_deg: float = 0.9, keep_n: int = 30):
+
+def build_points_real(gdf: gpd.GeoDataFrame, step_deg: float, keep_n: int, max_api_points: int) -> List[Dict[str, Any]]:
     """
-    Grid sample points INSIDE South Sudan and score using REAL Open-Meteo daily.
-    Returns list of dicts with:
-      lat, lon, now_total, fc7_total, trend30_total, features
+    REAL-ONLY points from Open-Meteo.
+    - now_total = past 7 days observed
+    - fc7_total = next 7 days forecast
+    - trend30_total = past 30 days observed
     """
     minx, miny, maxx, maxy = gdf.total_bounds
     poly = gdf.unary_union
 
-    pts = []
+    pts: List[Dict[str, Any]] = []
     lats = np.arange(miny, maxy, step_deg)
     lons = np.arange(minx, maxx, step_deg)
 
     for lat in lats:
         for lon in lons:
-            lat = float(lat); lon = float(lon)
+            if len(pts) >= max_api_points:
+                break
 
+            lat = float(lat)
+            lon = float(lon)
+
+            # inside boundary
             try:
                 if not poly.contains(gpd.points_from_xy([lon], [lat])[0]):
                     continue
@@ -367,14 +209,11 @@ def build_points_real(gdf: gpd.GeoDataFrame, step_deg: float = 0.9, keep_n: int 
                 pass
 
             wx = fetch_open_meteo_daily(lat, lon, past_days=30, forecast_days=7)
-            daily = wx.get("daily", {})
+            daily = wx.get("daily", {}) or {}
             precip = daily.get("precipitation_sum", []) or []
             tmean = daily.get("temperature_2m_mean", []) or []
 
-            # daily arrays contain (past_days + forecast_days)
-            # last 7 observed are the last 7 of the "past" window -> we take the slice that corresponds to "past period end"
-            # simplest stable assumption: Open-Meteo returns past days first, then forecast days.
-            past_len = min(len(precip), 30)  # expected 30
+            past_len = min(len(precip), 30)
             obs_precip = precip[:past_len]
             obs_tmean = tmean[:past_len]
             fc_precip = precip[past_len:past_len + 7]
@@ -394,46 +233,52 @@ def build_points_real(gdf: gpd.GeoDataFrame, step_deg: float = 0.9, keep_n: int 
                 obs_rain_30, obs_tmean_30,
             )
 
-            pts.append({
-                "lat": lat,
-                "lon": lon,
-                "now_total": now_total,
-                "fc7_total": fc7_total,
-                "trend30_total": trend30_total,
-                "features": features,
-            })
+            pts.append(
+                {
+                    "lat": lat,
+                    "lon": lon,
+                    "now_total": now_total,
+                    "fc7_total": fc7_total,
+                    "trend30_total": trend30_total,
+                    "features": features,
+                }
+            )
 
-    # rank by nowcast by default (you can change)
+    # rank by NOWCAST by default (what you see first)
     pts.sort(key=lambda p: p["now_total"], reverse=True)
     return pts[:keep_n]
 
-def compute_alerts_real(points, k: int = 6):
+
+def compute_alerts_7day(points: List[Dict[str, Any]], k: int) -> List[Dict[str, Any]]:
     """
-    Alerts = biggest improvement from now -> next 7 days forecast
+    Alerts = biggest change from now -> next 7 days (REAL).
     """
     scored = []
     for p in points:
         delta = float(p["fc7_total"] - p["now_total"])
         scored.append((p, delta))
     scored.sort(key=lambda t: t[1], reverse=True)
+
     out = []
     for p, delta in scored[:k]:
         f = p["features"]
-        reasons = top_reasons_from_features(f, "fc7")
-        out.append({
-            "lat": p["lat"],
-            "lon": p["lon"],
-            "delta": delta,
-            "now_total": p["now_total"],
-            "fc7_total": p["fc7_total"],
-            "trend30_total": p["trend30_total"],
-            "features": f,
-            "label": label_from_delta(delta),
-            "reasons": reasons,
-        })
+        out.append(
+            {
+                "lat": p["lat"],
+                "lon": p["lon"],
+                "delta": delta,
+                "now_total": p["now_total"],
+                "fc7_total": p["fc7_total"],
+                "trend30_total": p["trend30_total"],
+                "features": f,
+                "label": label_from_delta(delta),
+                "reasons": top_reasons(f, "fc7"),
+            }
+        )
     return out
 
-def nearest_alert(lat: float, lon: float, alerts: list[dict], tol_deg: float = 0.7):
+
+def nearest_alert(lat: float, lon: float, alerts: List[Dict[str, Any]], tol_deg: float = 0.7):
     best = None
     best_d2 = 1e18
     for idx, a in enumerate(alerts, start=1):
@@ -445,40 +290,45 @@ def nearest_alert(lat: float, lon: float, alerts: list[dict], tol_deg: float = 0
         return best[0], best[1]
     return None, None
 
+
 # ============================================================
-# Session state (fix “weird zoom” / blinking)
+# UI header + boundary
 # ============================================================
+st.title(TITLE)
+st.caption(CAPTION)
+
+gdf = load_boundary(BOUNDARY_PATH)
+south_sudan_geojson = gdf.__geo_interface__
+centroid = gdf.unary_union.centroid
+CENTER_LAT, CENTER_LON = float(centroid.y), float(centroid.x)
+
+# Session state (map view + selections)
 if "map_center" not in st.session_state:
     st.session_state.map_center = [CENTER_LAT, CENTER_LON]
 if "map_zoom" not in st.session_state:
     st.session_state.map_zoom = 6
-if "selected_info" not in st.session_state:
-    st.session_state.selected_info = None  # dict shown on right panel
+if "selected_alert" not in st.session_state:
+    st.session_state.selected_alert = None
+if "selected_point" not in st.session_state:
+    st.session_state.selected_point = None
 
 
 # ============================================================
-# Sidebar controls
+# Sidebar
 # ============================================================
 st.sidebar.header("Layers")
 
-# basemap choice
 basemap_choice = st.sidebar.radio(
     "Basemap",
-    options=[
-        "Street map (Carto)",
-        "Satellite (Esri World Imagery)",
-        "MODIS True Color (daily) — NASA GIBS",
-    ],
+    ["Street map (Carto)", "Satellite (Esri World Imagery)", "MODIS True Color (daily) — NASA GIBS"],
     index=0,
 )
 
-# MODIS date buttons (REAL daily tiles)
 modis_day_choice = st.sidebar.radio(
     "MODIS day",
     ["Today", "Yesterday", "2 days ago"],
-    index=1,  # default yesterday is most reliable
+    index=1,
     horizontal=True,
-    key="modis_day_choice",
 )
 
 days_back = {"Today": 0, "Yesterday": 1, "2 days ago": 2}[modis_day_choice]
@@ -490,23 +340,29 @@ show_imerg = st.sidebar.checkbox("IMERG Precipitation Rate (30-min) — NASA GIB
 overlay_opacity = st.sidebar.slider("Overlay opacity", 0.0, 1.0, 0.70, 0.05)
 
 st.sidebar.divider()
-st.sidebar.subheader("Model layers (dashboard outputs)")
+st.sidebar.subheader("Real model layers (from Open-Meteo)")
 show_boundary = st.sidebar.checkbox("South Sudan boundary", value=True)
 
-show_now_heat = st.sidebar.checkbox("Nowcast heatmap", value=True)
-show_now_markers = st.sidebar.checkbox("Nowcast markers", value=True)
+show_now_heat = st.sidebar.checkbox("Nowcast (past 7d) heatmap", value=True)
+show_now_markers = st.sidebar.checkbox("Nowcast (past 7d) markers", value=True)
 
-show_7_heat = st.sidebar.checkbox("Forecast (7 days) heatmap", value=False)
-show_7_markers = st.sidebar.checkbox("Forecast (7 days) markers", value=False)
+show_fc7_heat = st.sidebar.checkbox("Forecast (next 7d) heatmap", value=False)
+show_fc7_markers = st.sidebar.checkbox("Forecast (next 7d) markers", value=False)
 
-show_30_heat = st.sidebar.checkbox("Forecast (30 days) heatmap", value=False)
-show_30_markers = st.sidebar.checkbox("Forecast (30 days) markers", value=False)
+show_trend30_heat = st.sidebar.checkbox("30-day trend heatmap", value=False)
+show_trend30_markers = st.sidebar.checkbox("30-day trend markers", value=False)
 
-show_alerts = st.sidebar.checkbox("Anomaly alerts", value=True)
+show_alerts = st.sidebar.checkbox("Alerts (7-day change)", value=True)
 
 st.sidebar.divider()
 marker_size = st.sidebar.slider("Marker size", 6, 40, 18, 1)
 heat_opacity = st.sidebar.slider("Heat opacity", 0.10, 0.95, 0.55, 0.05)
+
+st.sidebar.divider()
+st.sidebar.subheader("Performance (Open-Meteo calls)")
+step_deg = st.sidebar.slider("Grid spacing (degrees)", 0.6, 1.6, 0.9, 0.1)
+max_api_points = st.sidebar.slider("Max API points per run", 10, 60, 25, 5)
+keep_n = st.sidebar.slider("Keep top points", 10, 50, 30, 5)
 
 st.sidebar.divider()
 c1, c2 = st.sidebar.columns(2)
@@ -521,32 +377,18 @@ with c2:
         st.session_state.map_zoom = 7
         st.rerun()
 
-st.sidebar.divider()
-auto_refresh = st.sidebar.checkbox("Auto-refresh (reload page)", value=False)
-refresh_seconds = st.sidebar.slider("Refresh every (seconds)", 30, 600, 120, 30)
 
-if auto_refresh:
-    # No extra packages required.
-    st.components.v1.html(
-        f"<script>setTimeout(function(){{window.location.reload();}}, {int(refresh_seconds)*1000});</script>",
-        height=0,
-    )
+# ============================================================
+# Build REAL points + alerts (Open-Meteo)
+# ============================================================
+with st.spinner("Fetching real weather (Open-Meteo) for sample points..."):
+    points = build_points_real(gdf, step_deg=step_deg, keep_n=keep_n, max_api_points=max_api_points)
+
+alerts_7 = compute_alerts_7day(points, k=6)
 
 
 # ============================================================
-# Generate points (weekly changes)
-# ============================================================
-points = build_points_real(gdf, step_deg=0.9, keep_n=30)
-
-# These are real-only outputs:
-# - Nowcast = last 7 days observed
-# - 7-day forecast = next 7 days forecast
-# - 30-day trend = last 30 days observed
-alerts_7 = compute_alerts_real(points, k=6)
-
-
-# ============================================================
-# Build Folium map
+# Folium map
 # ============================================================
 m = folium.Map(
     location=st.session_state.map_center,
@@ -556,26 +398,13 @@ m = folium.Map(
     prefer_canvas=True,
 )
 
-  # 'YYYY-MM-DD'
-
 # Basemaps
-folium.TileLayer(
-    CARTO,
-    name="Street map (Carto)",
-    overlay=False,
-    control=True,
-    show=(basemap_choice == "Street map (Carto)"),
-).add_to(m)
+folium.TileLayer(CARTO, name="Street map (Carto)", overlay=False, control=True,
+                 show=(basemap_choice == "Street map (Carto)")).add_to(m)
 
-folium.TileLayer(
-    tiles=ESRI_WORLD_IMAGERY,
-    attr="Esri World Imagery",
-    name="Satellite (Esri World Imagery)",
-    overlay=False,
-    control=True,
-    show=(basemap_choice == "Satellite (Esri World Imagery)"),
-).add_to(m)
-
+folium.TileLayer(tiles=ESRI_WORLD_IMAGERY, attr="Esri World Imagery",
+                 name="Satellite (Esri World Imagery)", overlay=False, control=True,
+                 show=(basemap_choice == "Satellite (Esri World Imagery)")).add_to(m)
 
 folium.TileLayer(
     tiles=make_gibs_modis_truecolor_url(modis_date),
@@ -586,7 +415,7 @@ folium.TileLayer(
     show=(basemap_choice == "MODIS True Color (daily) — NASA GIBS"),
 ).add_to(m)
 
-# IMERG overlay (REAL) + opacity works
+# IMERG overlay (REAL)
 if show_imerg:
     folium.TileLayer(
         tiles=make_gibs_imerg_url(),
@@ -608,8 +437,8 @@ if show_boundary:
     ).add_to(m)
 
 
-def add_heat(points: List[ScoredPoint], name: str, show: bool) -> None:
-    heat_data = [[p.lat, p.lon, p.total] for p in points]
+def add_heat_from_points(points_dicts: List[Dict[str, Any]], value_key: str, name: str, show: bool):
+    heat_data = [[p["lat"], p["lon"], float(p[value_key])] for p in points_dicts]
     HeatMap(
         heat_data,
         name=name,
@@ -621,50 +450,58 @@ def add_heat(points: List[ScoredPoint], name: str, show: bool) -> None:
     ).add_to(m)
 
 
-def add_markers(points: List[ScoredPoint], name: str, show: bool, max_n: int = 14) -> None:
+def add_markers_from_points(points_dicts: List[Dict[str, Any]], value_key: str, name: str, reason_mode: str, show: bool, max_n: int = 16):
     fg = folium.FeatureGroup(name=name, show=show)
-    for i, p in enumerate(points[:max_n], start=1):
-        drivers = top_drivers(p, n=2)
-        why = ", ".join([f"{k} ({v:.2f})" for k, v in drivers])
+    for i, p in enumerate(points_dicts[:max_n], start=1):
+        v = float(p[value_key])
+        f = p["features"]
+        reasons = top_reasons(f, reason_mode)
+        why = ", ".join([f"{k} ({val:.2f})" for k, val in reasons])
 
         popup_html = (
             f"<b>{name} #{i}</b><br>"
-            f"Total: {p.total:.2f}<br>"
-            f"Rainfall: {p.rainfall:.2f} | Forage: {p.forage:.2f} | Access: {p.access:.2f}<br>"
-            f"Lat/Lon: {p.lat:.3f}, {p.lon:.3f}<br>"
-            f"<b>Top drivers:</b> {why}"
+            f"Score: {v:.2f}<br>"
+            f"Lat/Lon: {p['lat']:.3f}, {p['lon']:.3f}<br>"
+            f"<b>Reasons:</b> {why}<br><br>"
+            f"<b>Raw (REAL):</b><br>"
+            f"Past 7d rain (mm): {f['obs_rain_7']:.1f}<br>"
+            f"Past 7d mean temp (°C): {f['obs_tmean_7']:.1f}<br>"
+            f"Next 7d rain (mm): {f['fc_rain_7']:.1f}<br>"
+            f"Next 7d mean temp (°C): {f['fc_tmean_7']:.1f}<br>"
+            f"Past 30d rain (mm): {f['obs_rain_30']:.1f}<br>"
+            f"Past 30d mean temp (°C): {f['obs_tmean_30']:.1f}"
         )
 
         folium.CircleMarker(
-            location=[p.lat, p.lon],
+            location=[p["lat"], p["lon"]],
             radius=int(marker_size),
             weight=2,
             color="#1f77b4",
             fill=True,
             fill_color="#1f77b4",
             fill_opacity=0.85,
-            tooltip=f"{name} #{i} • total {p.total:.2f}",
-            popup=folium.Popup(popup_html, max_width=360),
+            tooltip=f"{name} #{i} • {v:.2f}",
+            popup=folium.Popup(popup_html, max_width=420),
         ).add_to(fg)
 
     fg.add_to(m)
 
 
-# Model layers: split heatmap vs markers exactly
+# Layer split exactly
 if show_now_heat:
-    add_heat(now_pts, "Nowcast heatmap", show=True)
+    add_heat_from_points(points, "now_total", "Nowcast (past 7d) heatmap", show=True)
 if show_now_markers:
-    add_markers(now_pts, "Nowcast markers", show=True)
+    add_markers_from_points(points, "now_total", "Nowcast (past 7d) markers", "now", show=True)
 
-if show_7_heat:
-    add_heat(fc7_pts, "Forecast (7 days) heatmap", show=True)
-if show_7_markers:
-    add_markers(fc7_pts, "Forecast (7 days) markers", show=True)
+if show_fc7_heat:
+    add_heat_from_points(points, "fc7_total", "Forecast (next 7d) heatmap", show=True)
+if show_fc7_markers:
+    add_markers_from_points(points, "fc7_total", "Forecast (next 7d) markers", "fc7", show=True)
 
-if show_30_heat:
-    add_heat(fc30_pts, "Forecast (30 days) heatmap", show=True)
-if show_30_markers:
-    add_markers(fc30_pts, "Forecast (30 days) markers", show=True)
+if show_trend30_heat:
+    add_heat_from_points(points, "trend30_total", "30-day trend heatmap", show=True)
+if show_trend30_markers:
+    add_markers_from_points(points, "trend30_total", "30-day trend markers", "trend30", show=True)
 
 folium.LayerControl(collapsed=False).add_to(m)
 
@@ -676,6 +513,13 @@ left, right = st.columns([2.2, 1.0], gap="large")
 
 with left:
     map_out = st_folium(m, width=None, height=650)
+
+# persist view
+if isinstance(map_out, dict) and map_out.get("center") and map_out.get("zoom") is not None:
+    st.session_state.map_center = [map_out["center"]["lat"], map_out["center"]["lng"]]
+    st.session_state.map_zoom = int(map_out["zoom"])
+
+# click -> match to nearest ALERT (not any point)
 clicked = (map_out or {}).get("last_object_clicked")
 if clicked and "lat" in clicked and "lng" in clicked:
     clat, clon = float(clicked["lat"]), float(clicked["lng"])
@@ -685,131 +529,62 @@ if clicked and "lat" in clicked and "lng" in clicked:
         st.session_state.map_center = [a["lat"], a["lon"]]
         st.session_state.map_zoom = 9
         st.rerun()
-# Persist user pan/zoom (this is what stops “weird zoom”)
-if isinstance(map_out, dict):
-    # Keep view updated from user interactions
-    if map_out.get("center") and map_out.get("zoom") is not None:
-        st.session_state.map_center = [map_out["center"]["lat"], map_out["center"]["lng"]]
-        st.session_state.map_zoom = int(map_out["zoom"])
-
-# Marker click -> show details on right
-clicked = (map_out or {}).get("last_object_clicked")
-if clicked and "lat" in clicked and "lng" in clicked:
-    clat, clon = float(clicked["lat"]), float(clicked["lng"])
-
-    # find which layer it’s closest to (now / 7 / 30)
-    i_now, p_now, d_now = nearest_point(clat, clon, now_pts)
-    i_7, p_7, d_7 = nearest_point(clat, clon, fc7_pts)
-    i_30, p_30, d_30 = nearest_point(clat, clon, fc30_pts)
-
-    best = min(
-        [("Nowcast", i_now, p_now, d_now), ("Forecast 7d", i_7, p_7, d_7), ("Forecast 30d", i_30, p_30, d_30)],
-        key=lambda t: t[3],
-    )
-
-    name, idx, p, d2 = best
-    # Only accept if click is reasonably close (degrees² threshold)
-    if p is not None and d2 <= (0.35 ** 2):
-        drivers = top_drivers(p, n=2)
-        st.session_state.selected_info = {
-            "layer": name,
-            "idx": int(idx) + 1 if idx is not None else None,
-            "lat": p.lat,
-            "lon": p.lon,
-            "total": p.total,
-            "rainfall": p.rainfall,
-            "forage": p.forage,
-            "access": p.access,
-            "drivers": drivers,
-        }
 
 
 # ============================================================
-# Alerts panel
+# Right panel
 # ============================================================
-def alert_card(title: str, idx: int, a: AlertItem, key_prefix: str):
-    p = a.point
-    drivers_txt = ", ".join([f"{k} ({v:.2f})" for k, v in a.drivers])
-
-    st.markdown(f"**{idx}. {a.label}**")
-    st.caption(f"Lat/Lon: {p.lat:.3f}, {p.lon:.3f}")
-
-    m1, m2 = st.columns(2)
-    with m1:
-        st.metric("Delta vs nowcast", f"{a.delta:+.2f}")
-    with m2:
-        st.metric("Forecast total", f"{p.total:.2f}")
-
-    s1, s2, s3 = st.columns(3)
-    s1.metric("Rainfall", f"{p.rainfall:.2f}")
-    s2.metric("Forage", f"{p.forage:.2f}")
-    s3.metric("Access", f"{p.access:.2f}")
-
-    st.caption(f"Top drivers: {drivers_txt}")
-
-    b1, b2 = st.columns(2)
-    with b1:
-        if st.button(f"Zoom to alert #{idx}", key=f"{key_prefix}_z_{idx}"):
-            st.session_state.map_center = [p.lat, p.lon]
-            st.session_state.map_zoom = 9
-            st.rerun()
-    with b2:
-        if st.button("Zoom closer", key=f"{key_prefix}_zz_{idx}"):
-            st.session_state.map_center = [p.lat, p.lon]
-            st.session_state.map_zoom = 11
-            st.rerun()
-
-    st.divider()
-
-
 with right:
     st.header("Alerts")
-    st.caption("Alerts highlight places where forecast suitability increases vs nowcast (delta score).")
-    # --- Selected-from-map / selected alert (Part D) ---
-    si = st.session_state.get("selected_info")
-    if si:
-        st.subheader("Selected marker")
-        st.caption(f"{si['layer']} • point #{si['idx']} • Lat/Lon: {si['lat']:.3f}, {si['lon']:.3f}")
+    st.caption("REAL: Alerts = biggest change from nowcast → next 7 days (Open-Meteo).")
+
+    sel = st.session_state.selected_alert
+    if sel:
+        st.subheader("Selected (from map click)")
+        st.caption(f"Alert #{sel['idx']} • Lat/Lon: {sel['lat']:.3f}, {sel['lon']:.3f}")
 
         c1, c2 = st.columns(2)
-        c1.metric("Total score", f"{si['total']:.2f}")
-        c2.metric("Top drivers", ", ".join([f"{k} ({v:.2f})" for k, v in si["drivers"]]))
+        c1.metric("Delta (fc7 - now)", f"{sel['delta']:+.2f}")
+        c2.metric("Forecast score", f"{sel['fc7_total']:.2f}")
 
-        s1, s2, s3 = st.columns(3)
-        s1.metric("Rainfall", f"{si['rainfall']:.2f}")
-        s2.metric("Forage", f"{si['forage']:.2f}")
-        s3.metric("Access", f"{si['access']:.2f}")
-
+        f = sel["features"]
+        st.write("**Reasons (scores 0..1):** " + ", ".join([f"{k} ({v:.2f})" for k, v in sel["reasons"]]))
+        st.write(
+            f"**Raw REAL:** past7 rain {f['obs_rain_7']:.1f}mm, past7 temp {f['obs_tmean_7']:.1f}°C • "
+            f"next7 rain {f['fc_rain_7']:.1f}mm, next7 temp {f['fc_tmean_7']:.1f}°C"
+        )
         st.divider()
-    # Selected marker info
-    if st.session_state.selected_info is not None:
-        si = st.session_state.selected_info
-        st.subheader("Selected marker")
-        st.caption(f"{si['layer']} • point #{si['idx']} • Lat/Lon: {si['lat']:.3f}, {si['lon']:.3f}")
 
-        mm1, mm2 = st.columns(2)
-        mm1.metric("Total score", f"{si['total']:.2f}")
-        mm2.metric("Top drivers", ", ".join([f"{k} ({v:.2f})" for k, v in si["drivers"]]))
+    st.subheader("7-day alerts (change)")
+    if not show_alerts:
+        st.info("Turn on **Alerts (7-day change)** in the sidebar.")
+    else:
+        for i, a in enumerate(alerts_7, start=1):
+            reasons_txt = ", ".join([f"{k} ({v:.2f})" for k, v in a["reasons"]])
+            st.markdown(f"**{i}. {a['label']}**")
+            st.caption(f"Lat/Lon: {a['lat']:.3f}, {a['lon']:.3f}")
 
-        ss1, ss2, ss3 = st.columns(3)
-        ss1.metric("Rainfall", f"{si['rainfall']:.2f}")
-        ss2.metric("Forage", f"{si['forage']:.2f}")
-        ss3.metric("Access", f"{si['access']:.2f}")
+            m1, m2 = st.columns(2)
+            m1.metric("Delta", f"{a['delta']:+.2f}")
+            m2.metric("Forecast score", f"{a['fc7_total']:.2f}")
 
-        st.divider()
+            st.caption("Reasons: " + reasons_txt)
+
+            b1, b2 = st.columns(2)
+            with b1:
+                if st.button(f"Zoom to alert #{i}", key=f"z_{i}"):
+                    st.session_state.map_center = [a["lat"], a["lon"]]
+                    st.session_state.map_zoom = 9
+                    st.rerun()
+            with b2:
+                if st.button("Zoom closer", key=f"zz_{i}"):
+                    st.session_state.map_center = [a["lat"], a["lon"]]
+                    st.session_state.map_zoom = 11
+                    st.rerun()
+
+            st.divider()
 
     st.info(
-        f"**Real layers:** MODIS True Color (NASA GIBS, {modis_date}) and IMERG precipitation (NASA GIBS). "
-        f"**Your ‘cow movement’ layers** are currently a placeholder scoring engine until you connect a real model/data feed."
+        f"**Real data used:** Open-Meteo daily precip/temp (past 30d + next 7d), "
+        f"NASA GIBS MODIS True Color (date: {modis_date}) and optional IMERG overlay tiles."
     )
-
-    if not show_alerts:
-        st.warning("Turn on **Anomaly alerts** in the sidebar to view alerts.")
-    else:
-        st.subheader("7-day")
-        for i, a in enumerate(alerts_7, start=1):
-            alert_card("7-day", i, a, "a7")
-
-        st.subheader("30-day")
-        for i, a in enumerate(alerts_30, start=1):
-            alert_card("30-day", i, a, "a30")
