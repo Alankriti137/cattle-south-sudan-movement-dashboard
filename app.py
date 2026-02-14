@@ -311,6 +311,11 @@ if "selected_alert" not in st.session_state:
 if "selected_point" not in st.session_state:
     st.session_state.selected_point = None
 
+if "pending_zoom_to_alert" not in st.session_state:
+    st.session_state.pending_zoom_to_alert = False
+
+if "last_click_key" not in st.session_state:
+    st.session_state.last_click_key = None
 
 # ============================================================
 # Sidebar
@@ -504,7 +509,6 @@ if show_trend30_markers:
 
 folium.LayerControl(collapsed=False).add_to(m)
 
-
 # ============================================================
 # Layout
 # ============================================================
@@ -512,47 +516,61 @@ left, right = st.columns([2.2, 1.0], gap="large")
 
 with left:
     map_out = st_folium(
-    m,
-    width=None,
-    height=650,
-    key="main_map",
-    returned_objects=["last_object_clicked", "center", "zoom"],
-)
+        m,
+        width=None,
+        height=650,
+        key="main_map",
+        returned_objects=["last_object_clicked", "center", "zoom"],
+    )
 
-# ---------- Persist user pan/zoom (GUARDED) ----------
+# ---------- Persist user pan/zoom (ROUNDED + GUARDED) ----------
 if isinstance(map_out, dict):
     new_center = map_out.get("center")
     new_zoom = map_out.get("zoom")
 
     if new_center and (new_zoom is not None):
+        new_lat = round(float(new_center["lat"]), 4)
+        new_lng = round(float(new_center["lng"]), 4)
+        new_zoom_i = int(round(float(new_zoom)))
+
         old_center = st.session_state.get("map_center", [CENTER_LAT, CENTER_LON])
-        old_zoom = st.session_state.get("map_zoom", 6)
+        old_zoom = int(st.session_state.get("map_zoom", 6))
 
-    if "pending_zoom_to_alert" not in st.session_state:
-        st.session_state.pending_zoom_to_alert = False
+        old_lat = round(float(old_center[0]), 4)
+        old_lng = round(float(old_center[1]), 4)
 
-        moved = (abs(new_center["lat"] - old_center[0]) > 1e-4) or (abs(new_center["lng"] - old_center[1]) > 1e-4)
-        zoomed = (int(new_zoom) != int(old_zoom))
+        moved = (new_lat != old_lat) or (new_lng != old_lng)
+        zoomed = (new_zoom_i != old_zoom)
 
-        # IMPORTANT: don't overwrite center/zoom if we are about to force-zoom to an alert
-        # (this prevents the “bounce”)
-        if (st.session_state.get("pending_zoom_to_alert") is not True) and (moved or zoomed):
-            st.session_state.map_center = [new_center["lat"], new_center["lng"]]
-            st.session_state.map_zoom = int(new_zoom)
+        if (st.session_state.pending_zoom_to_alert is False) and (moved or zoomed):
+            st.session_state.map_center = [new_lat, new_lng]
+            st.session_state.map_zoom = new_zoom_i
 
-# ---------- Click -> match to nearest ALERT ----------
+# ---------- Click -> match to nearest ALERT (DEBOUNCED) ----------
 clicked = (map_out or {}).get("last_object_clicked")
 if clicked and "lat" in clicked and "lng" in clicked:
-    clat, clon = float(clicked["lat"]), float(clicked["lng"])
-    idx, a = nearest_alert(clat, clon, alerts_7, tol_deg=0.7)
-    if idx is not None:
-        st.session_state.selected_alert = {"idx": idx, **a}
-        st.session_state.map_center = [a["lat"], a["lon"]]
-        st.session_state.map_zoom = 9
-        st.session_state.pending_zoom_to_alert = True
-        st.rerun()
+    clat = round(float(clicked["lat"]), 4)
+    clon = round(float(clicked["lng"]), 4)
+    click_key = (clat, clon)
 
-# consume the pending flag after rerun completes
+    # stop rerun loop from the same click surviving across reruns
+    if click_key != st.session_state.last_click_key:
+        st.session_state.last_click_key = click_key
+
+        idx, a = nearest_alert(clat, clon, alerts_7, tol_deg=0.7)
+        if idx is not None:
+            st.session_state.selected_alert = {"idx": idx, **a}
+            st.session_state.map_center = [round(a["lat"], 4), round(a["lon"], 4)]
+            st.session_state.map_zoom = 9
+            st.session_state.pending_zoom_to_alert = True
+            st.rerun()
+
+# consume the pending flag exactly once after a forced zoom
+if st.session_state.pending_zoom_to_alert:
+    st.session_state.pending_zoom_to_alert = False
+
+
+
 if st.session_state.get("pending_zoom_to_alert"):
     st.session_state.pending_zoom_to_alert = False
 
@@ -600,11 +618,13 @@ with right:
                 if st.button(f"Zoom to alert #{i}", key=f"z_{i}"):
                     st.session_state.map_center = [a["lat"], a["lon"]]
                     st.session_state.map_zoom = 9
+                    st.session_state.pending_zoom_to_alert = True
                     st.rerun()
             with b2:
                 if st.button("Zoom closer", key=f"zz_{i}"):
                     st.session_state.map_center = [a["lat"], a["lon"]]
                     st.session_state.map_zoom = 11
+                    st.session_state.pending_zoom_to_alert = True
                     st.rerun()
 
             st.divider()
