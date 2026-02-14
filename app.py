@@ -310,6 +310,11 @@ if "selected_alert" not in st.session_state:
     st.session_state.selected_alert = None
 if "selected_point" not in st.session_state:
     st.session_state.selected_point = None
+if "selected_alert_idx" not in st.session_state:
+    st.session_state.selected_alert_idx = None  # 1..6
+
+if "selected_alert" not in st.session_state:
+    st.session_state.selected_alert = None
 
 if "pending_zoom_to_alert" not in st.session_state:
     st.session_state.pending_zoom_to_alert = False
@@ -559,6 +564,7 @@ if clicked and "lat" in clicked and "lng" in clicked:
 
         idx, a = nearest_alert(clat, clon, alerts_7, tol_deg=0.7)
         if idx is not None:
+            st.session_state.selected_alert_idx = idx
             st.session_state.selected_alert = {"idx": idx, **a}
             st.session_state.map_center = [round(a["lat"], 4), round(a["lon"], 4)]
             st.session_state.map_zoom = 9
@@ -603,8 +609,11 @@ with right:
         st.info("Turn on **Alerts (7-day change)** in the sidebar.")
     else:
         for i, a in enumerate(alerts_7, start=1):
+            is_selected = (st.session_state.get("selected_alert_idx") == i)
+
             reasons_txt = ", ".join([f"{k} ({v:.2f})" for k, v in a["reasons"]])
-            st.markdown(f"**{i}. {a['label']}**")
+
+            st.markdown(f"{'✅ ' if is_selected else ''}**{i}. {a['label']}**")
             st.caption(f"Lat/Lon: {a['lat']:.3f}, {a['lon']:.3f}")
 
             m1, m2 = st.columns(2)
@@ -616,13 +625,18 @@ with right:
             b1, b2 = st.columns(2)
             with b1:
                 if st.button(f"Zoom to alert #{i}", key=f"z_{i}"):
-                    st.session_state.map_center = [a["lat"], a["lon"]]
+                    st.session_state.selected_alert_idx = i
+                    st.session_state.selected_alert = {"idx": i, **a}
+                    st.session_state.map_center = [round(a["lat"], 4), round(a["lon"], 4)]
                     st.session_state.map_zoom = 9
                     st.session_state.pending_zoom_to_alert = True
                     st.rerun()
+                    
             with b2:
                 if st.button("Zoom closer", key=f"zz_{i}"):
-                    st.session_state.map_center = [a["lat"], a["lon"]]
+                    st.session_state.selected_alert_idx = i
+                    st.session_state.selected_alert = {"idx": i, **a}
+                    st.session_state.map_center = [round(a["lat"], 4), round(a["lon"], 4)]
                     st.session_state.map_zoom = 11
                     st.session_state.pending_zoom_to_alert = True
                     st.rerun()
