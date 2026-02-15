@@ -471,85 +471,122 @@ folium.LayerControl(collapsed=False).add_to(m)
 
 
 # ============================================================
-# Layout  (NO persist-pan/zoom, NO forced reruns on click)
+# Layout (NO map persistence = NO blinking)
 # ============================================================
 left, right = st.columns([2.2, 1.0], gap="large")
+
+# ---- Build a fast lookup so clicks select the right alert ----
+# key = rounded lat/lon -> alert index (1..k)
+alert_lookup = {(round(a["lat"], 4), round(a["lon"], 4)): i for i, a in enumerate(alerts_7, start=1)}
+
+def pick_alert_from_click(clat: float, clon: float):
+    key = (round(clat, 4), round(clon, 4))
+    if key in alert_lookup:
+        idx = alert_lookup[key]
+        return idx, alerts_7[idx - 1]
+    # fallback: nearest
+    idx, a = nearest_alert(clat, clon, alerts_7, tol_deg=0.7)
+    return idx, a
+
+# ---- Add ALERT markers (so clicking is reliable) ----
+if show_alerts:
+    fg_alerts = folium.FeatureGroup(name="Alerts (7-day change)", show=True)
+    for i, a in enumerate(alerts_7, start=1):
+        folium.CircleMarker(
+            location=[a["lat"], a["lon"]],
+            radius=10,
+            weight=3,
+            color="#d62728",
+            fill=True,
+            fill_color="#d62728",
+            fill_opacity=0.9,
+            tooltip=f"Alert #{i}: {a['label']} (Δ {a['delta']:+.2f})",
+        ).add_to(fg_alerts)
+    fg_alerts.add_to(m)
 
 with left:
     map_out = st_folium(
         m,
         width=None,
         height=650,
-        key="main_map",  # keep stable
-        returned_objects=["last_object_clicked"],
+        key="main_map",
+        returned_objects=["last_object_clicked"],  # keep it minimal (less flicker)
     )
 
-# --- Click marker -> select nearest alert (NO zoom, NO st.rerun) ---
+# ---- Click handling (NO st.rerun here!) ----
 clicked = (map_out or {}).get("last_object_clicked")
 if clicked and "lat" in clicked and "lng" in clicked:
-    clat = float(clicked["lat"])
-    clon = float(clicked["lng"])
-
-    idx, a = nearest_alert(clat, clon, alerts_7, tol_deg=0.7)
+    clat, clon = float(clicked["lat"]), float(clicked["lng"])
+    idx, a = pick_alert_from_click(clat, clon)
     if idx is not None:
         st.session_state.selected_alert_idx = idx
         st.session_state.selected_alert = {"idx": idx, **a}
+        # OPTIONAL: if you want zoom-on-click, do it ONLY by setting state (no rerun call)
+        st.session_state.map_center = [a["lat"], a["lon"]]
+        st.session_state.map_zoom = 9
 
+# ============================================================
+# Right panel
+# ============================================================
 with right:
     st.header("Alerts")
-    st.caption("REAL: Alerts = biggest change from nowcast → next 7 days (Open-Meteo).")
+    st.caption("REAL inputs: Open-Meteo (past 30d + next 7d). Alerts = biggest change now → next 7 days.")
 
-    # Selected alert (from map click OR from buttons)
     sel = st.session_state.get("selected_alert")
     if sel:
         st.subheader("Selected alert")
-        st.caption(f"Alert #{sel['idx']} • Lat/Lon: {sel['lat']:.3f}, {sel['lon']:.3f}")
+        st.markdown(f"**✅ Alert #{sel['idx']}: {sel['label']}**")
+        st.caption(f"Lat/Lon: {sel['lat']:.3f}, {sel['lon']:.3f}")
 
         c1, c2 = st.columns(2)
         c1.metric("Delta (fc7 - now)", f"{sel['delta']:+.2f}")
         c2.metric("Forecast score", f"{sel['fc7_total']:.2f}")
 
         f = sel["features"]
-        st.write("**Reasons (0..1):** " + ", ".join([f"{k} ({v:.2f})" for k, v in sel["reasons"]]))
+
+        # show weighted contributions so “reasons” differ more
+        rain_contrib = 0.60 * f["water_fc7"]
+        comfort_contrib = 0.40 * f["comfort_fc7"]
+        reasons = [
+            ("Forecast rainfall contribution", rain_contrib),
+            ("Forecast heat comfort contribution", comfort_contrib),
+        ]
+        reasons.sort(key=lambda t: t[1], reverse=True)
+
+        st.write("**Top reasons (weighted):** " + ", ".join([f"{k} ({v:.2f})" for k, v in reasons]))
         st.write(
-            f"**Raw REAL:** past7 rain {f['obs_rain_7']:.1f}mm, past7 temp {f['obs_tmean_7']:.1f}°C • "
-            f"next7 rain {f['fc_rain_7']:.1f}mm, next7 temp {f['fc_tmean_7']:.1f}°C"
+            f"**Raw REAL:** next7 rain {f['fc_rain_7']:.1f}mm, next7 temp {f['fc_tmean_7']:.1f}°C • "
+            f"past7 rain {f['obs_rain_7']:.1f}mm, past7 temp {f['obs_tmean_7']:.1f}°C"
         )
         st.divider()
 
     st.subheader("7-day alerts (change)")
-
     if not show_alerts:
         st.info("Turn on **Alerts (7-day change)** in the sidebar.")
     else:
         for i, a in enumerate(alerts_7, start=1):
             is_selected = (st.session_state.get("selected_alert_idx") == i)
-            reasons_txt = ", ".join([f"{k} ({v:.2f})" for k, v in a["reasons"]])
-
             st.markdown(f"{'✅ ' if is_selected else ''}**{i}. {a['label']}**")
             st.caption(f"Lat/Lon: {a['lat']:.3f}, {a['lon']:.3f}")
-            st.caption("Reasons: " + reasons_txt)
+
+            m1, m2 = st.columns(2)
+            m1.metric("Delta", f"{a['delta']:+.2f}")
+            m2.metric("Forecast score", f"{a['fc7_total']:.2f}")
 
             b1, b2 = st.columns(2)
-
-            # NOTE: Buttons cause a rerun automatically. We do NOT call st.rerun().
             with b1:
-                if st.button(f"Zoom to alert #{i}", key=f"z_{i}"):
+                if st.button(f"Select #{i}", key=f"sel_{i}"):
+                    st.session_state.selected_alert_idx = i
+                    st.session_state.selected_alert = {"idx": i, **a}
+            with b2:
+                if st.button(f"Zoom #{i}", key=f"zoom_{i}"):
                     st.session_state.selected_alert_idx = i
                     st.session_state.selected_alert = {"idx": i, **a}
                     st.session_state.map_center = [a["lat"], a["lon"]]
                     st.session_state.map_zoom = 9
-
-            with b2:
-                if st.button("Zoom closer", key=f"zz_{i}"):
-                    st.session_state.selected_alert_idx = i
-                    st.session_state.selected_alert = {"idx": i, **a}
-                    st.session_state.map_center = [a["lat"], a["lon"]]
-                    st.session_state.map_zoom = 11
-
             st.divider()
 
     st.info(
-        f"**Real data used:** Open-Meteo daily precip/temp (past 30d + next 7d), "
-        f"NASA GIBS MODIS True Color (date: {modis_date}) and optional IMERG overlay tiles."
+        f"**Real data used:** Open-Meteo daily precip/temp + NASA GIBS MODIS True Color (date: {modis_date}) "
+        f"+ optional IMERG overlay tiles."
     )
