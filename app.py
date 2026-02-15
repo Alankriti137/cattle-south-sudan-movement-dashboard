@@ -1,6 +1,6 @@
 import math
 from datetime import datetime, timezone, timedelta
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Optional, Dict, Any
 
 import json
 import urllib.request
@@ -13,14 +13,13 @@ import folium
 from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 
-
 # ============================================================
 # Page config
 # ============================================================
 st.set_page_config(page_title="Cattle in South Sudan Movement Dashboard", layout="wide")
 
 TITLE = "Cattle in South Sudan Movement Dashboard"
-CAPTION = "REAL drivers only: Open-Meteo (rain/temp) + NASA GIBS (MODIS/IMERG tiles)"
+CAPTION = "REAL drivers only: Open-Meteo (rain/temp) + NASA GIBS (imagery/IMERG tiles)"
 BOUNDARY_PATH = "data/south_sudan.geojson.json"
 
 # Basemaps / tiles (REAL)
@@ -87,7 +86,7 @@ def make_gibs_imerg_url() -> str:
 # ============================================================
 # REAL weather fetch (Open-Meteo) — cached
 # ============================================================
-@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)  # cache 24h = no constant refetching
+@st.cache_data(ttl=60 * 60, show_spinner=False)
 def fetch_open_meteo_daily(lat: float, lon: float, past_days: int = 30, forecast_days: int = 7) -> dict:
     base = "https://api.open-meteo.com/v1/forecast"
     params = {
@@ -111,17 +110,12 @@ def score_from_real_weather(
     obs_rain_30: float,
     obs_tmean_30: float,
 ) -> Tuple[float, float, float, Dict[str, float]]:
-    """
-    REAL inputs (Open-Meteo). Convert to 0..1 scores:
-      - Water score from rainfall
-      - Comfort score from temperature (hotter = worse)
-    """
     # rainfall scoring (mm)
     water_7 = normalize(obs_rain_7, 0.0, 70.0)
     water_fc7 = normalize(fc_rain_7, 0.0, 70.0)
     water_30 = normalize(obs_rain_30, 0.0, 200.0)
 
-    # temperature comfort scoring (C)
+    # temperature comfort (C) — hotter => worse comfort
     comfort_7 = 1.0 - normalize(obs_tmean_7, 28.0, 42.0)
     comfort_fc7 = 1.0 - normalize(fc_tmean_7, 28.0, 42.0)
     comfort_30 = 1.0 - normalize(obs_tmean_30, 28.0, 42.0)
@@ -151,10 +145,7 @@ def top_reasons(features: Dict[str, float], mode: str) -> List[Tuple[str, float]
     if mode == "now":
         drivers = [("Rainfall (past 7d)", features["water_7"]), ("Heat comfort (past 7d)", features["comfort_7"])]
     elif mode == "fc7":
-        drivers = [
-            ("Forecast rainfall (next 7d)", features["water_fc7"]),
-            ("Forecast heat comfort (next 7d)", features["comfort_fc7"]),
-        ]
+        drivers = [("Forecast rainfall (next 7d)", features["water_fc7"]), ("Forecast heat comfort (next 7d)", features["comfort_fc7"])]
     else:
         drivers = [("Rainfall (past 30d)", features["water_30"]), ("Heat comfort (past 30d)", features["comfort_30"])]
 
@@ -174,30 +165,18 @@ def label_from_delta(delta: float) -> str:
     return "Small change"
 
 
-def build_points_real(
-    gdf: gpd.GeoDataFrame,
-    step_deg: float,
-    keep_n: int,
-    max_api_points: int,
-) -> List[Dict[str, Any]]:
-    """
-    REAL-ONLY grid sample points from Open-Meteo.
-    Outputs per point:
-      - now_total (past 7d)
-      - fc7_total (next 7d)
-      - trend30_total (past 30d)
-    """
+def build_points_real(gdf: gpd.GeoDataFrame, step_deg: float, keep_n: int, max_api_points: int) -> List[Dict[str, Any]]:
     minx, miny, maxx, maxy = gdf.total_bounds
     poly = gdf.unary_union
 
     pts: List[Dict[str, Any]] = []
-    lats = np.arange(miny, maxy + 1e-9, step_deg)
-    lons = np.arange(minx, maxx + 1e-9, step_deg)
+    lats = np.arange(miny, maxy, step_deg)
+    lons = np.arange(minx, maxx, step_deg)
 
     for lat in lats:
         for lon in lons:
             if len(pts) >= max_api_points:
-                return pts[:keep_n]  # hard stop (prevents too many API calls)
+                break
 
             lat = float(lat)
             lon = float(lon)
@@ -213,7 +192,6 @@ def build_points_real(
             precip = daily.get("precipitation_sum", []) or []
             tmean = daily.get("temperature_2m_mean", []) or []
 
-            # Open-Meteo returns past then forecast in the same arrays
             past_len = min(len(precip), 30)
             obs_precip = precip[:past_len]
             obs_tmean = tmean[:past_len]
@@ -234,16 +212,14 @@ def build_points_real(
                 obs_rain_30, obs_tmean_30,
             )
 
-            pts.append(
-                {
-                    "lat": lat,
-                    "lon": lon,
-                    "now_total": now_total,
-                    "fc7_total": fc7_total,
-                    "trend30_total": trend30_total,
-                    "features": features,
-                }
-            )
+            pts.append({
+                "lat": lat,
+                "lon": lon,
+                "now_total": now_total,
+                "fc7_total": fc7_total,
+                "trend30_total": trend30_total,
+                "features": features,
+            })
 
     pts.sort(key=lambda p: p["now_total"], reverse=True)
     return pts[:keep_n]
@@ -259,37 +235,35 @@ def compute_alerts_7day(points: List[Dict[str, Any]], k: int) -> List[Dict[str, 
     out = []
     for p, delta in scored[:k]:
         f = p["features"]
-        out.append(
-            {
-                "lat": p["lat"],
-                "lon": p["lon"],
-                "delta": delta,
-                "now_total": p["now_total"],
-                "fc7_total": p["fc7_total"],
-                "trend30_total": p["trend30_total"],
-                "features": f,
-                "label": label_from_delta(delta),
-                "reasons": top_reasons(f, "fc7"),
-            }
-        )
+        out.append({
+            "lat": p["lat"],
+            "lon": p["lon"],
+            "delta": delta,
+            "now_total": p["now_total"],
+            "fc7_total": p["fc7_total"],
+            "trend30_total": p["trend30_total"],
+            "features": f,
+            "label": label_from_delta(delta),
+            "reasons": top_reasons(f, "fc7"),
+        })
     return out
 
 
-def nearest_alert(lat: float, lon: float, alerts: List[Dict[str, Any]], tol_deg: float = 0.7):
-    best = None
+def nearest_alert_idx(lat: float, lon: float, alerts: List[Dict[str, Any]], tol_deg: float = 0.7) -> Optional[int]:
+    best_idx = None
     best_d2 = 1e18
     for idx, a in enumerate(alerts, start=1):
         d2 = (a["lat"] - lat) ** 2 + (a["lon"] - lon) ** 2
         if d2 < best_d2:
             best_d2 = d2
-            best = (idx, a)
-    if best and best_d2 <= (tol_deg ** 2):
-        return best[0], best[1]
-    return None, None
+            best_idx = idx
+    if best_idx is not None and best_d2 <= (tol_deg ** 2):
+        return best_idx
+    return None
 
 
 # ============================================================
-# Header + boundary load
+# UI header + boundary
 # ============================================================
 st.title(TITLE)
 st.caption(CAPTION)
@@ -299,20 +273,15 @@ south_sudan_geojson = gdf.__geo_interface__
 centroid = gdf.unary_union.centroid
 CENTER_LAT, CENTER_LON = float(centroid.y), float(centroid.x)
 
-
-# ============================================================
-# Session state (NO pan/zoom persistence to avoid blinking)
-# ============================================================
+# Session state
 if "map_center" not in st.session_state:
     st.session_state.map_center = [CENTER_LAT, CENTER_LON]
 if "map_zoom" not in st.session_state:
     st.session_state.map_zoom = 6
-if "selected_alert" not in st.session_state:
-    st.session_state.selected_alert = None
 if "selected_alert_idx" not in st.session_state:
     st.session_state.selected_alert_idx = None
-if "last_click_key" not in st.session_state:
-    st.session_state.last_click_key = None
+if "selected_alert" not in st.session_state:
+    st.session_state.selected_alert = None
 
 
 # ============================================================
@@ -329,7 +298,7 @@ basemap_choice = st.sidebar.radio(
 modis_day_choice = st.sidebar.radio(
     "MODIS day",
     ["Today", "Yesterday", "2 days ago"],
-    index=1,  # yesterday is most reliable for GIBS daily
+    index=1,
     horizontal=True,
 )
 
@@ -342,7 +311,7 @@ show_imerg = st.sidebar.checkbox("IMERG Precipitation Rate (30-min) — NASA GIB
 overlay_opacity = st.sidebar.slider("Overlay opacity", 0.0, 1.0, 0.70, 0.05)
 
 st.sidebar.divider()
-st.sidebar.subheader("Real model layers (Open-Meteo)")
+st.sidebar.subheader("Real model layers (from Open-Meteo)")
 show_boundary = st.sidebar.checkbox("South Sudan boundary", value=True)
 
 show_now_heat = st.sidebar.checkbox("Nowcast (past 7d) heatmap", value=True)
@@ -363,8 +332,8 @@ heat_opacity = st.sidebar.slider("Heat opacity", 0.10, 0.95, 0.55, 0.05)
 st.sidebar.divider()
 st.sidebar.subheader("Performance (Open-Meteo calls)")
 step_deg = st.sidebar.slider("Grid spacing (degrees)", 0.6, 1.6, 0.9, 0.1)
-max_api_points = st.sidebar.slider("Max API points per day", 10, 80, 25, 5)
-keep_n = st.sidebar.slider("Keep top points", 10, 60, 30, 5)
+max_api_points = st.sidebar.slider("Max API points per run", 10, 60, 25, 5)
+keep_n = st.sidebar.slider("Keep top points", 10, 50, 30, 5)
 
 st.sidebar.divider()
 c1, c2 = st.sidebar.columns(2)
@@ -372,6 +341,8 @@ with c1:
     if st.button("Reset view"):
         st.session_state.map_center = [CENTER_LAT, CENTER_LON]
         st.session_state.map_zoom = 6
+        st.session_state.selected_alert_idx = None
+        st.session_state.selected_alert = None
         st.rerun()
 with c2:
     if st.button("Zoom to S. Sudan"):
@@ -383,14 +354,14 @@ with c2:
 # ============================================================
 # Build REAL points + alerts (Open-Meteo)
 # ============================================================
-with st.spinner("Loading real weather (Open-Meteo) for sample points..."):
+with st.spinner("Fetching real weather (Open-Meteo) for sample points..."):
     points = build_points_real(gdf, step_deg=step_deg, keep_n=keep_n, max_api_points=max_api_points)
 
 alerts_7 = compute_alerts_7day(points, k=6)
 
 
 # ============================================================
-# Build Folium map
+# Folium map
 # ============================================================
 m = folium.Map(
     location=st.session_state.map_center,
@@ -401,33 +372,14 @@ m = folium.Map(
 )
 
 # Basemaps
-folium.TileLayer(
-    CARTO,
-    name="Street map (Carto)",
-    overlay=False,
-    control=True,
-    show=(basemap_choice == "Street map (Carto)"),
-).add_to(m)
+folium.TileLayer(CARTO, name="Street map (Carto)", overlay=False, control=True, show=(basemap_choice == "Street map (Carto)")).add_to(m)
+folium.TileLayer(tiles=ESRI_WORLD_IMAGERY, attr="Esri World Imagery", name="Satellite (Esri World Imagery)",
+                 overlay=False, control=True, show=(basemap_choice == "Satellite (Esri World Imagery)")).add_to(m)
+folium.TileLayer(tiles=make_gibs_modis_truecolor_url(modis_date), attr=f"NASA GIBS (MODIS True Color) — {modis_date}",
+                 name="MODIS True Color (daily) — NASA GIBS", overlay=False, control=True,
+                 show=(basemap_choice == "MODIS True Color (daily) — NASA GIBS")).add_to(m)
 
-folium.TileLayer(
-    tiles=ESRI_WORLD_IMAGERY,
-    attr="Esri World Imagery",
-    name="Satellite (Esri World Imagery)",
-    overlay=False,
-    control=True,
-    show=(basemap_choice == "Satellite (Esri World Imagery)"),
-).add_to(m)
-
-folium.TileLayer(
-    tiles=make_gibs_modis_truecolor_url(modis_date),
-    attr=f"NASA GIBS (MODIS True Color) — {modis_date}",
-    name="MODIS True Color (daily) — NASA GIBS",
-    overlay=False,
-    control=True,
-    show=(basemap_choice == "MODIS True Color (daily) — NASA GIBS"),
-).add_to(m)
-
-# IMERG overlay (REAL)
+# IMERG overlay
 if show_imerg:
     folium.TileLayer(
         tiles=make_gibs_imerg_url(),
@@ -465,23 +417,23 @@ def add_heat(points_dicts: List[Dict[str, Any]], value_key: str, name: str, show
 def add_markers(points_dicts: List[Dict[str, Any]], value_key: str, name: str, reason_mode: str, show: bool, max_n: int = 16):
     fg = folium.FeatureGroup(name=name, show=show)
     for i, p in enumerate(points_dicts[:max_n], start=1):
-        score = float(p[value_key])
+        v = float(p[value_key])
         f = p["features"]
         reasons = top_reasons(f, reason_mode)
         why = ", ".join([f"{k} ({val:.2f})" for k, val in reasons])
 
         popup_html = (
             f"<b>{name} #{i}</b><br>"
-            f"Score: {score:.2f}<br>"
+            f"Score: {v:.2f}<br>"
             f"Lat/Lon: {p['lat']:.3f}, {p['lon']:.3f}<br>"
             f"<b>Reasons:</b> {why}<br><br>"
-            f"<b>Raw REAL:</b><br>"
-            f"Past 7d rain: {f['obs_rain_7']:.1f} mm<br>"
-            f"Past 7d mean temp: {f['obs_tmean_7']:.1f} °C<br>"
-            f"Next 7d rain: {f['fc_rain_7']:.1f} mm<br>"
-            f"Next 7d mean temp: {f['fc_tmean_7']:.1f} °C<br>"
-            f"Past 30d rain: {f['obs_rain_30']:.1f} mm<br>"
-            f"Past 30d mean temp: {f['obs_tmean_30']:.1f} °C"
+            f"<b>Raw (REAL):</b><br>"
+            f"Past 7d rain: {f['obs_rain_7']:.1f}mm<br>"
+            f"Past 7d mean temp: {f['obs_tmean_7']:.1f}°C<br>"
+            f"Next 7d rain: {f['fc_rain_7']:.1f}mm<br>"
+            f"Next 7d mean temp: {f['fc_tmean_7']:.1f}°C<br>"
+            f"Past 30d rain: {f['obs_rain_30']:.1f}mm<br>"
+            f"Past 30d mean temp: {f['obs_tmean_30']:.1f}°C"
         )
 
         folium.CircleMarker(
@@ -492,14 +444,14 @@ def add_markers(points_dicts: List[Dict[str, Any]], value_key: str, name: str, r
             fill=True,
             fill_color="#1f77b4",
             fill_opacity=0.85,
-            tooltip=f"{name} #{i} • {score:.2f}",
+            tooltip=f"{name} #{i} • {v:.2f}",
             popup=folium.Popup(popup_html, max_width=420),
         ).add_to(fg)
 
     fg.add_to(m)
 
 
-# Split heatmaps/markers exactly
+# Layers
 if show_now_heat:
     add_heat(points, "now_total", "Nowcast (past 7d) heatmap", show=True)
 if show_now_markers:
@@ -524,18 +476,22 @@ folium.LayerControl(collapsed=False).add_to(m)
 left, right = st.columns([2.2, 1.0], gap="large")
 
 with left:
+    # IMPORTANT: we do NOT persist center/zoom from map_out -> reduces blinking a lot
     map_out = st_folium(
         m,
         width=None,
         height=650,
         key="main_map",
-        returned_objects=["last_object_clicked"],  # keep minimal = less flicker
+        returned_objects=["last_object_clicked"],
     )
 
-# Click -> select nearest alert (NO rerun, no forced zoom = minimal blink)
+# Click -> select alert on the right (NO st.rerun here)
 clicked = (map_out or {}).get("last_object_clicked")
 if clicked and "lat" in clicked and "lng" in clicked:
-    clat = round(float(clicked["lat"]), 4)
-    clon = round(float(clicked["lng"]), 4)
-    click_key = (clat, clon
+    clat = float(clicked["lat"])
+    clon = float(clicked["lng"])
+    idx = nearest_alert_idx(clat, clon, alerts_7, tol_deg=0.7)
+    if idx is not None:
+        st.session_state.selected_alert_idx = idx
+        st.sessi
 ::contentReference[oaicite:0]{index=0}
