@@ -9,9 +9,8 @@ import urllib.parse
 import numpy as np
 import geopandas as gpd
 import streamlit as st
-import folium
-from folium.plugins import HeatMap
-from streamlit_folium import st_folium
+import pandas as pd
+import pydeck as pdk
 
 # ============================================================
 # Page config
@@ -377,13 +376,15 @@ st.sidebar.divider()
 c1, c2 = st.sidebar.columns(2)
 with c1:
     if st.button("Reset view"):
-        st.session_state.map_center = [CENTER_LAT, CENTER_LON]
-        st.session_state.map_zoom = 6
+        st.session_state.view_lat = float(a["lat"])
+        st.session_state.view_lon = float(a["lon"])
+        st.session_state.view_zoom = 9  # or 11 for closer
         st.rerun()
 with c2:
     if st.button("Zoom to S. Sudan"):
-        st.session_state.map_center = [CENTER_LAT, CENTER_LON]
-        st.session_state.map_zoom = 7
+        st.session_state.view_lat = float(a["lat"])
+        st.session_state.view_lon = float(a["lon"])
+        st.session_state.view_zoom = 9  # or 11 for closer
         st.rerun()
 
 
@@ -397,122 +398,187 @@ alerts_7 = compute_alerts_7day(points, k=6)
 
 
 # ============================================================
-# Folium map
+# PyDeck map (NO blinking like Folium)
 # ============================================================
-m = folium.Map(
-    location=st.session_state.map_center,
-    zoom_start=st.session_state.map_zoom,
-    tiles=None,
-    control_scale=True,
-    prefer_canvas=True,
+
+# --- Build DataFrame for layers ---
+df = pd.DataFrame(points)
+df["id"] = np.arange(len(df))  # stable id for selection
+df["delta_fc7_now"] = df["fc7_total"] - df["now_total"]
+
+# Build alerts df (for highlighting)
+alerts_df = pd.DataFrame(alerts_7)
+if not alerts_df.empty:
+    alerts_df["alert_idx"] = np.arange(1, len(alerts_df) + 1)
+
+# --- Basemap styles (Mapbox styles; no Esri here) ---
+MAP_STYLE_STREET = "mapbox://styles/mapbox/light-v10"
+MAP_STYLE_SAT = "mapbox://styles/mapbox/satellite-v9"
+
+# NASA GIBS tiles
+MODIS_TILE = make_gibs_modis_truecolor_url(modis_date)
+IMERG_TILE = make_gibs_imerg_url()
+
+# --- Session state for view ---
+if "view_lat" not in st.session_state:
+    st.session_state.view_lat = CENTER_LAT
+if "view_lon" not in st.session_state:
+    st.session_state.view_lon = CENTER_LON
+if "view_zoom" not in st.session_state:
+    st.session_state.view_zoom = 6
+
+# If user clicked an alert button earlier, we already set these:
+view_state = pdk.ViewState(
+    latitude=float(st.session_state.view_lat),
+    longitude=float(st.session_state.view_lon),
+    zoom=float(st.session_state.view_zoom),
+    pitch=0,
+    bearing=0,
 )
 
-# Basemaps
-folium.TileLayer(CARTO, name="Street map (Carto)", overlay=False, control=True,
-                 show=(basemap_choice == "Street map (Carto)")).add_to(m)
-
-folium.TileLayer(tiles=ESRI_WORLD_IMAGERY, attr="Esri World Imagery",
-                 name="Satellite (Esri World Imagery)", overlay=False, control=True,
-                 show=(basemap_choice == "Satellite (Esri World Imagery)")).add_to(m)
-
-folium.TileLayer(
-    tiles=make_gibs_modis_truecolor_url(modis_date),
-    attr=f"NASA GIBS (MODIS True Color) — {modis_date}",
-    name="MODIS True Color (daily) — NASA GIBS",
-    overlay=False,
-    control=True,
-    show=(basemap_choice == "MODIS True Color (daily) — NASA GIBS"),
-).add_to(m)
-
-# IMERG overlay (REAL)
-if show_imerg:
-    folium.TileLayer(
-        tiles=make_gibs_imerg_url(),
-        attr="NASA GIBS (GPM IMERG Precipitation Rate)",
-        name="IMERG Precipitation Rate (30-min) — NASA GIBS",
-        overlay=True,
-        control=True,
-        opacity=float(overlay_opacity),
-        show=True,
-    ).add_to(m)
+# --- Layers ---
+layers = []
 
 # Boundary
 if show_boundary:
-    folium.GeoJson(
-        south_sudan_geojson,
-        name="South Sudan boundary",
-        style_function=lambda x: {"fillOpacity": 0.0, "color": "black", "weight": 3},
-        show=True,
-    ).add_to(m)
+    layers.append(
+        pdk.Layer(
+            "GeoJsonLayer",
+            data=south_sudan_geojson,
+            stroked=True,
+            filled=False,
+            get_line_color=[0, 0, 0, 200],
+            line_width_min_pixels=2,
+            pickable=False,
+        )
+    )
 
+# MODIS as a basemap option (tile layer)
+# If MODIS is selected as "basemap", we lay MODIS tiles on top of a neutral street style.
+if basemap_choice == "MODIS True Color (daily) — NASA GIBS":
+    layers.append(
+        pdk.Layer(
+            "TileLayer",
+            data=MODIS_TILE,
+            min_zoom=0,
+            max_zoom=9,
+            tile_size=256,
+            opacity=1.0,
+        )
+    )
 
-def add_heat_from_points(points_dicts: List[Dict[str, Any]], value_key: str, name: str, show: bool):
-    heat_data = [[p["lat"], p["lon"], float(p[value_key])] for p in points_dicts]
-    HeatMap(
-        heat_data,
-        name=name,
-        radius=28,
-        blur=22,
-        min_opacity=0.10,
-        max_opacity=float(heat_opacity),
-        show=show,
-    ).add_to(m)
+# IMERG overlay
+if show_imerg:
+    layers.append(
+        pdk.Layer(
+            "TileLayer",
+            data=IMERG_TILE,
+            min_zoom=0,
+            max_zoom=8,
+            tile_size=256,
+            opacity=float(overlay_opacity),
+        )
+    )
 
+# Heatmaps (weights are real scores)
+def add_heat(df_in: pd.DataFrame, value_col: str, enabled: bool, name: str):
+    if not enabled or df_in.empty:
+        return
+    layers.append(
+        pdk.Layer(
+            "HeatmapLayer",
+            data=df_in,
+            get_position=["lon", "lat"],
+            get_weight=value_col,
+            radius_pixels=60,   # feel free to tweak
+            intensity=1.0,
+            threshold=0.05,
+        )
+    )
 
-def add_markers_from_points(points_dicts: List[Dict[str, Any]], value_key: str, name: str, reason_mode: str, show: bool, max_n: int = 16):
-    fg = folium.FeatureGroup(name=name, show=show)
-    for i, p in enumerate(points_dicts[:max_n], start=1):
-        v = float(p[value_key])
-        f = p["features"]
-        reasons = top_reasons(f, reason_mode)
-        why = ", ".join([f"{k} ({val:.2f})" for k, val in reasons])
+# Markers
+def add_markers(df_in: pd.DataFrame, value_col: str, enabled: bool, name: str):
+    if not enabled or df_in.empty:
+        return
+    layers.append(
+        pdk.Layer(
+            "ScatterplotLayer",
+            data=df_in,
+            get_position=["lon", "lat"],
+            get_radius=int(marker_size) * 800,  # meters-ish
+            radius_min_pixels=4,
+            radius_max_pixels=30,
+            get_fill_color=[31, 119, 180, 180],
+            get_line_color=[31, 119, 180, 255],
+            line_width_min_pixels=1,
+            pickable=True,
+            auto_highlight=True,
+        )
+    )
 
-        popup_html = (
-            f"<b>{name} #{i}</b><br>"
-            f"Score: {v:.2f}<br>"
-            f"Lat/Lon: {p['lat']:.3f}, {p['lon']:.3f}<br>"
-            f"<b>Reasons:</b> {why}<br><br>"
-            f"<b>Raw (REAL):</b><br>"
-            f"Past 7d rain (mm): {f['obs_rain_7']:.1f}<br>"
-            f"Past 7d mean temp (°C): {f['obs_tmean_7']:.1f}<br>"
-            f"Next 7d rain (mm): {f['fc_rain_7']:.1f}<br>"
-            f"Next 7d mean temp (°C): {f['fc_tmean_7']:.1f}<br>"
-            f"Past 30d rain (mm): {f['obs_rain_30']:.1f}<br>"
-            f"Past 30d mean temp (°C): {f['obs_tmean_30']:.1f}"
+# Split layers exactly like you wanted
+add_heat(df, "now_total", show_now_heat, "Nowcast heat")
+add_markers(df, "now_total", show_now_markers, "Nowcast markers")
+
+add_heat(df, "fc7_total", show_fc7_heat, "Forecast heat")
+add_markers(df, "fc7_total", show_fc7_markers, "Forecast markers")
+
+add_heat(df, "trend30_total", show_trend30_heat, "30-day trend heat")
+add_markers(df, "trend30_total", show_trend30_markers, "30-day trend markers")
+
+# Highlight the selected alert (draw a bigger red dot)
+sel_idx = st.session_state.get("selected_alert_idx")
+if sel_idx and not alerts_df.empty:
+    sel_row = alerts_df[alerts_df["alert_idx"] == int(sel_idx)]
+    if not sel_row.empty:
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                data=sel_row,
+                get_position=["lon", "lat"],
+                get_radius=25000,
+                radius_min_pixels=10,
+                get_fill_color=[220, 0, 0, 180],
+                get_line_color=[220, 0, 0, 255],
+                line_width_min_pixels=2,
+                pickable=False,
+            )
         )
 
-        folium.CircleMarker(
-            location=[p["lat"], p["lon"]],
-            radius=int(marker_size),
-            weight=2,
-            color="#1f77b4",
-            fill=True,
-            fill_color="#1f77b4",
-            fill_opacity=0.85,
-            tooltip=f"{name} #{i} • {v:.2f}",
-            popup=folium.Popup(popup_html, max_width=420),
-        ).add_to(fg)
+# Tooltip (REAL reasons + raw values)
+tooltip = {
+    "html": """
+    <b>Score:</b> {now_total}<br/>
+    <b>Forecast:</b> {fc7_total}<br/>
+    <b>30-day trend:</b> {trend30_total}<br/>
+    <b>Δ (fc7-now):</b> {delta_fc7_now}<br/>
+    <hr/>
+    <b>Raw REAL (Open-Meteo):</b><br/>
+    Past 7d rain: {features.obs_rain_7} mm<br/>
+    Past 7d temp: {features.obs_tmean_7} °C<br/>
+    Next 7d rain: {features.fc_rain_7} mm<br/>
+    Next 7d temp: {features.fc_tmean_7} °C<br/>
+    Past 30d rain: {features.obs_rain_30} mm<br/>
+    Past 30d temp: {features.obs_tmean_30} °C
+    """,
+    "style": {"backgroundColor": "white", "color": "black"},
+}
 
-    fg.add_to(m)
+# Map style choice
+if basemap_choice == "Satellite (Esri World Imagery)":
+    # Closest non-Esri option: Mapbox satellite (still real imagery, different provider).
+    map_style = MAP_STYLE_SAT
+elif basemap_choice == "MODIS True Color (daily) — NASA GIBS":
+    map_style = MAP_STYLE_STREET
+else:
+    map_style = MAP_STYLE_STREET
 
-
-# Layer split exactly
-if show_now_heat:
-    add_heat_from_points(points, "now_total", "Nowcast (past 7d) heatmap", show=True)
-if show_now_markers:
-    add_markers_from_points(points, "now_total", "Nowcast (past 7d) markers", "now", show=True)
-
-if show_fc7_heat:
-    add_heat_from_points(points, "fc7_total", "Forecast (next 7d) heatmap", show=True)
-if show_fc7_markers:
-    add_markers_from_points(points, "fc7_total", "Forecast (next 7d) markers", "fc7", show=True)
-
-if show_trend30_heat:
-    add_heat_from_points(points, "trend30_total", "30-day trend heatmap", show=True)
-if show_trend30_markers:
-    add_markers_from_points(points, "trend30_total", "30-day trend markers", "trend30", show=True)
-
-folium.LayerControl(collapsed=False).add_to(m)
+deck = pdk.Deck(
+    layers=layers,
+    initial_view_state=view_state,
+    map_style=map_style,
+    tooltip=tooltip,
+)
 
 # ============================================================
 # Layout
@@ -520,70 +586,34 @@ folium.LayerControl(collapsed=False).add_to(m)
 left, right = st.columns([2.2, 1.0], gap="large")
 
 with left:
-    map_out = st_folium(
-        m,
-        width=None,
-        height=650,
-        key="main_map",
-        returned_objects=["last_object_clicked", "center", "zoom"],
-    )
+    # If your Streamlit supports selection events, this enables click->select.
+    # If it errors, comment out on_select/selection_mode and you still get tooltips + alert buttons.
+    try:
+        event = st.pydeck_chart(
+            deck,
+            use_container_width=True,
+            height=650,
+            on_select="rerun",
+            selection_mode="single-object",
+        )
+    except TypeError:
+        event = None
+        st.pydeck_chart(deck, use_container_width=True, height=650)
 
-# ---------- 1) CLICK HANDLER FIRST (prevents bounce) ----------
-clicked = (map_out or {}).get("last_object_clicked")
-if clicked and "lat" in clicked and "lng" in clicked:
-    clat = round(float(clicked["lat"]), 4)
-    clon = round(float(clicked["lng"]), 4)
-    click_key = (clat, clon)
+# Marker click -> select nearest alert + highlight it on the right
+# (We avoid changing view unless it's an alert button; that keeps it smooth.)
+if isinstance(event, dict):
+    sel = (event.get("selection") or {}).get("objects") or []
+    if sel:
+        obj = sel[0]
+        # obj should include picked row fields
+        lat = float(obj.get("lat", 0))
+        lon = float(obj.get("lon", 0))
 
-    # debounce: ignore same click across reruns
-    if click_key != st.session_state.last_click_key:
-        st.session_state.last_click_key = click_key
-
-        idx, a = nearest_alert(clat, clon, alerts_7, tol_deg=0.7)
+        idx, a = nearest_alert(lat, lon, alerts_7, tol_deg=0.7)
         if idx is not None:
             st.session_state.selected_alert_idx = idx
             st.session_state.selected_alert = {"idx": idx, **a}
-
-            # force zoom
-            st.session_state.map_center = [round(a["lat"], 4), round(a["lon"], 4)]
-            st.session_state.map_zoom = 9
-
-            # IMPORTANT: mark we are forcing view so we don't overwrite right after
-            st.session_state.pending_zoom_to_alert = True
-            st.rerun()
-
-# ---------- 2) PERSIST PAN/ZOOM (only after boot + not during forced zoom) ----------
-if isinstance(map_out, dict):
-    new_center = map_out.get("center")
-    new_zoom = map_out.get("zoom")
-
-    # boot: first render of folium is noisy; don't save its center/zoom
-    if not st.session_state.map_booted:
-        if new_center and (new_zoom is not None):
-            st.session_state.map_booted = True
-    else:
-        if new_center and (new_zoom is not None) and (st.session_state.pending_zoom_to_alert is False):
-            new_lat = round(float(new_center["lat"]), 4)
-            new_lng = round(float(new_center["lng"]), 4)
-            new_zoom_i = int(round(float(new_zoom)))
-
-            old_center = st.session_state.get("map_center", [CENTER_LAT, CENTER_LON])
-            old_zoom = int(st.session_state.get("map_zoom", 6))
-            old_lat = round(float(old_center[0]), 4)
-            old_lng = round(float(old_center[1]), 4)
-
-            moved = (new_lat != old_lat) or (new_lng != old_lng)
-            zoomed = (new_zoom_i != old_zoom)
-
-            if moved or zoomed:
-                st.session_state.map_center = [new_lat, new_lng]
-                st.session_state.map_zoom = new_zoom_i
-
-# ---------- 3) CONSUME FORCED-ZOOM FLAG (exactly once) ----------
-if st.session_state.pending_zoom_to_alert:
-    st.session_state.pending_zoom_to_alert = False
-if st.session_state.pending_zoom_to_alert:
-    st.session_state.pending_zoom_to_alert = False
 
 # ============================================================
 # Right panel
@@ -632,8 +662,9 @@ with right:
                 if st.button(f"Zoom to alert #{i}", key=f"z_{i}"):
                     st.session_state.selected_alert_idx = i
                     st.session_state.selected_alert = {"idx": i, **a}
-                    st.session_state.map_center = [round(a["lat"], 4), round(a["lon"], 4)]
-                    st.session_state.map_zoom = 9
+                    st.session_state.view_lat = float(a["lat"])
+                    st.session_state.view_lon = float(a["lon"])
+                    st.session_state.view_zoom = 9  # or 11 for closer
                     st.session_state.pending_zoom_to_alert = True
                     st.rerun()
                     
@@ -641,8 +672,9 @@ with right:
                 if st.button("Zoom closer", key=f"zz_{i}"):
                     st.session_state.selected_alert_idx = i
                     st.session_state.selected_alert = {"idx": i, **a}
-                    st.session_state.map_center = [round(a["lat"], 4), round(a["lon"], 4)]
-                    st.session_state.map_zoom = 11
+                    st.session_state.view_lat = float(a["lat"])
+                    st.session_state.view_lon = float(a["lon"])
+                    st.session_state.view_zoom = 11  # or 11 for closer
                     st.session_state.pending_zoom_to_alert = True
                     st.rerun()
 
